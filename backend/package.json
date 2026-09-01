@@ -1,0 +1,22 @@
+{
+  "name": "smart-v2v-backend",
+  "version": "1.0.0",
+  "description": "SMART V2V Communication - Node.js + Socket.IO backend",
+  "main": "backend.js",
+  "scripts": {
+    "start": "node backend.js",
+    "dev": "node backend.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.22.2",
+    "http": "^0.0.1-security",
+    "socket.io": "^4.8.3"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
