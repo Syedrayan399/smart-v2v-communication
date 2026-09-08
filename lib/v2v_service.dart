@@ -23,7 +23,9 @@ class V2VService {
   late final String _baseUrl;
 
   String? _vehicleId;
+  String? _vehicleName;
   String? _vehicleType;
+  String _vehicleStatus = 'ACTIVE';
 
   double? _latitude;
   double? _longitude;
@@ -31,6 +33,9 @@ class V2VService {
   double _speed = 0;
   double _direction = 0;
   bool _braking = false;
+
+  double _gpsAccuracy = 0;
+  int _gpsTimestamp = 0;
 
   bool _disposed = false;
   bool _isConnecting = false;
@@ -131,6 +136,10 @@ class V2VService {
   Function(Map<String, dynamic>)?
       onVehiclePosition;
 
+  // Complete active vehicle snapshot for the Intelligence live map.
+  Function(Map<String, dynamic>)?
+      onLiveMapData;
+
   Function(String)?
       onVehicleRemoved;
 
@@ -155,24 +164,35 @@ class V2VService {
 
   void connect({
     required String vehicleId,
+    required String vehicleName,
     required String vehicleType,
+    required String vehicleStatus,
     required double latitude,
     required double longitude,
+    required double gpsAccuracy,
+    required int gpsTimestamp,
   }) {
     _disposed = false;
 
     _vehicleId = vehicleId;
+    _vehicleName = vehicleName;
     _vehicleType = vehicleType;
+    _vehicleStatus = vehicleStatus;
     _latitude = latitude;
     _longitude = longitude;
+    _gpsAccuracy = gpsAccuracy;
+    _gpsTimestamp = gpsTimestamp;
 
     print('🔌 ========================================');
     print('🔌 CONNECTING V2V');
     print('🌐 URL: $_baseUrl');
     print('🚗 Vehicle ID: $vehicleId');
+    print('🏷️ Vehicle Name: $vehicleName');
     print('🚙 Vehicle Type: $vehicleType');
+    print('🚦 Vehicle Status: $vehicleStatus');
     print('📍 Latitude: $latitude');
     print('📍 Longitude: $longitude');
+    print('🎯 GPS Accuracy: $gpsAccuracy m');
     print('🔌 Mode: $connectionMode');
     print('🔌 ========================================');
 
@@ -190,11 +210,18 @@ class V2VService {
       // Update latest location and make sure backend receives it.
       updateVehicle(
         vehicleId: vehicleId,
+        name: _vehicleName ?? vehicleId,
+        type: vehicleType,
+        status: _vehicleStatus,
         latitude: latitude,
         longitude: longitude,
         speed: _speed,
         direction: _direction,
         braking: _braking,
+        gpsAccuracy: _gpsAccuracy,
+        gpsTimestamp: _gpsTimestamp > 0
+            ? _gpsTimestamp
+            : DateTime.now().millisecondsSinceEpoch,
       );
 
       return;
@@ -514,6 +541,25 @@ class V2VService {
     );
 
     // ==========================================================
+    // LIVE MAP DATA
+    // ==========================================================
+
+    socket.on(
+      'liveMapData',
+      (data) {
+        if (!identical(socket, _socket) ||
+            _disposed ||
+            data is! Map) {
+          return;
+        }
+
+        onLiveMapData?.call(
+          Map<String, dynamic>.from(data),
+        );
+      },
+    );
+
+    // ==========================================================
     // VEHICLE REMOVED
     // ==========================================================
 
@@ -556,7 +602,9 @@ class V2VService {
     final socket = _socket;
 
     final vehicleId = _vehicleId;
+    final vehicleName = _vehicleName;
     final vehicleType = _vehicleType;
+    final vehicleStatus = _vehicleStatus;
 
     final latitude = _latitude;
     final longitude = _longitude;
@@ -571,6 +619,7 @@ class V2VService {
     }
 
     if (vehicleId == null ||
+        vehicleName == null ||
         vehicleType == null ||
         latitude == null ||
         longitude == null) {
@@ -582,12 +631,19 @@ class V2VService {
 
     final payload = {
       'vehicleId': vehicleId,
+      'name': vehicleName,
+      'vehicleName': vehicleName,
       'type': vehicleType,
+      'status': vehicleStatus,
       'latitude': latitude,
       'longitude': longitude,
       'speed': _speed,
       'direction': _direction,
       'braking': _braking,
+      'gpsAccuracy': _gpsAccuracy,
+      'gpsTimestamp': _gpsTimestamp > 0
+          ? _gpsTimestamp
+          : DateTime.now().millisecondsSinceEpoch,
     };
 
     print(
@@ -606,18 +662,28 @@ class V2VService {
 
   void updateVehicle({
     required String vehicleId,
+    required String name,
+    required String type,
+    required String status,
     required double latitude,
     required double longitude,
     required double speed,
     required double direction,
     required bool braking,
+    required double gpsAccuracy,
+    required int gpsTimestamp,
   }) {
     _vehicleId = vehicleId;
+    _vehicleName = name;
+    _vehicleType = type;
+    _vehicleStatus = status;
     _latitude = latitude;
     _longitude = longitude;
     _speed = speed;
     _direction = direction;
     _braking = braking;
+    _gpsAccuracy = gpsAccuracy;
+    _gpsTimestamp = gpsTimestamp;
 
     final socket = _socket;
 
@@ -631,11 +697,63 @@ class V2VService {
       'vehicleUpdate',
       {
         'vehicleId': vehicleId,
+        'name': name,
+        'vehicleName': name,
+        'type': type,
+        'status': status,
         'latitude': latitude,
         'longitude': longitude,
         'speed': speed,
         'direction': direction,
         'braking': braking,
+        'gpsAccuracy': gpsAccuracy,
+        'gpsTimestamp': gpsTimestamp,
+      },
+    );
+  }
+
+  // ============================================================
+  // REQUEST LIVE MAP DATA
+  // ============================================================
+
+  void requestLiveMapData() {
+    final socket = _socket;
+
+    if (socket == null ||
+        !socket.connected ||
+        _disposed) {
+      return;
+    }
+
+    socket.emit(
+      'requestLiveMapData',
+    );
+  }
+
+  // ============================================================
+  // UPDATE VEHICLE STATUS
+  // ============================================================
+
+  void updateVehicleStatus({
+    required String vehicleId,
+    required String status,
+  }) {
+    _vehicleId = vehicleId;
+    _vehicleStatus = status;
+
+    final socket = _socket;
+
+    if (socket == null ||
+        !socket.connected ||
+        _disposed) {
+      return;
+    }
+
+    socket.emit(
+      'vehicleStatusUpdate',
+      {
+        'vehicleId': vehicleId,
+        'status': status,
       },
     );
   }

@@ -223,6 +223,9 @@ class _V2VHomePageState
 
   bool braking = false;
 
+  // ACTIVE, PARKED, STOPPED, OFFLINE or EMERGENCY.
+  String vehicleStatus = 'ACTIVE';
+
   // =====================================================
   // GPS STATUS
   // =====================================================
@@ -236,6 +239,9 @@ class _V2VHomePageState
   // Horizontal accuracy reported by the GPS chip (metres).
   // Lower = better. Indoor values are often 30–150 m.
   double gpsAccuracyMeters = 999.0;
+
+  // Time of the last accepted GPS fix shown in the GPS status card.
+  DateTime? lastGpsUpdate;
 
   // Only trust a fix for critical alerts when accuracy is this good or better.
   static const double _maxAccuracyForCriticalAlert = 20.0;
@@ -345,6 +351,10 @@ class _V2VHomePageState
   // =====================================================
 
   List<dynamic> nearbyVehicles = [];
+
+  // Complete active-vehicle snapshot received from the backend for the
+  // Intelligence live map. Nearby Vehicles remains a separate, filtered list.
+  List<dynamic> liveMapVehicles = [];
 
   // Only vehicles within this radius are kept and displayed.
   static const double _nearbyVehicleDisplayRadiusMeters = 100.0;
@@ -1182,6 +1192,111 @@ class _V2VHomePageState
     );
   }
 
+
+  // =====================================================
+  // VEHICLE SETTINGS
+  // =====================================================
+
+  Future<void> _showVehicleSettingsDialog() async {
+    String selectedType = vehicleType;
+    String enteredName = vehicleName;
+
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return StatefulBuilder(
+          builder: (BuildContext context, StateSetter setDialogState) {
+            return AlertDialog(
+              title: const Text('Vehicle Settings'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextFormField(
+                      initialValue: vehicleName,
+                      textCapitalization: TextCapitalization.words,
+                      maxLength: 30,
+                      onChanged: (String value) {
+                        enteredName = value;
+                      },
+                      decoration: const InputDecoration(
+                        labelText: 'Vehicle Name',
+                        prefixIcon: Icon(Icons.drive_file_rename_outline),
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      value: selectedType,
+                      decoration: const InputDecoration(
+                        labelText: 'Vehicle Type',
+                        prefixIcon: Icon(Icons.directions_car_filled_rounded),
+                        border: OutlineInputBorder(),
+                      ),
+                      items: _vehicleTypes
+                          .map((String type) => DropdownMenuItem<String>(
+                                value: type,
+                                child: Text(type),
+                              ))
+                          .toList(),
+                      onChanged: (String? value) {
+                        if (value != null) {
+                          setDialogState(() {
+                            selectedType = value;
+                          });
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    Navigator.of(dialogContext).pop();
+                  },
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () async {
+                    FocusManager.instance.primaryFocus?.unfocus();
+                    await Future<void>.delayed(
+                      const Duration(milliseconds: 100),
+                    );
+
+                    if (!mounted || !dialogContext.mounted) {
+                      return;
+                    }
+
+                    setState(() {
+                      final String trimmedName = enteredName.trim();
+                      vehicleName = trimmedName.isEmpty
+                          ? 'My $selectedType'
+                          : trimmedName;
+                      vehicleType = selectedType;
+                    });
+
+                    await _saveVehicleDetails();
+
+                    if (dialogContext.mounted) {
+                      Navigator.of(dialogContext).pop();
+                    }
+
+                    _showSnackBar(
+                      'Vehicle details saved.',
+                      Colors.green,
+                    );
+                  },
+                  child: const Text('Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
   // =====================================================
   // APP LIFECYCLE
   // =====================================================
@@ -1277,8 +1392,10 @@ class _V2VHomePageState
       });
 
       // Ask the backend for an immediate snapshot. This prevents the
-      // Nearby Vehicles card from staying empty until the next GPS update.
+      // Nearby Vehicles card and live map from staying empty until the
+      // next GPS update.
       _sendVehicleUpdate();
+      v2vService.requestLiveMapData();
     };
 
     v2vService.onNearbyVehicles =
@@ -1307,6 +1424,15 @@ class _V2VHomePageState
     ) {
       _handleVehiclePosition(
         data,
+      );
+    };
+
+    v2vService.onLiveMapData =
+        (
+      List<dynamic> vehicles,
+    ) {
+      _handleLiveMapData(
+        vehicles,
       );
     };
 
@@ -1396,9 +1522,27 @@ class _V2VHomePageState
 
     v2vService.connect(
       vehicleId: vehicleId,
-      vehicleType: vehicleType,
-      latitude: latitude,
-      longitude: longitude,
+      vehicleName:
+          vehicleName.isEmpty
+              ? vehicleId
+              : vehicleName,
+      vehicleType:
+          vehicleType,
+      vehicleStatus:
+          vehicleStatus,
+      latitude:
+          latitude,
+      longitude:
+          longitude,
+      gpsAccuracy:
+          gpsAccuracyMeters.isFinite
+              ? gpsAccuracyMeters
+              : 0,
+      gpsTimestamp:
+          lastGpsUpdate
+              ?.millisecondsSinceEpoch ??
+          DateTime.now()
+              .millisecondsSinceEpoch,
     );
   }
 
@@ -1725,6 +1869,8 @@ class _V2VHomePageState
 
       gpsAccuracyMeters = accuracy;
 
+      lastGpsUpdate = DateTime.now();
+
       gpsConnected = true;
 
       if (accuracy > _maxAccuracyForCriticalAlert) {
@@ -1770,12 +1916,34 @@ class _V2VHomePageState
     _lastVehicleUpdateSentAt = now;
 
     v2vService.updateVehicle(
-      vehicleId: vehicleId,
-      latitude: latitude,
-      longitude: longitude,
-      speed: speed,
-      direction: direction,
-      braking: braking,
+      vehicleId:
+          vehicleId,
+      name:
+          vehicleName.isEmpty
+              ? vehicleId
+              : vehicleName,
+      type:
+          vehicleType,
+      status:
+          vehicleStatus,
+      latitude:
+          latitude,
+      longitude:
+          longitude,
+      speed:
+          speed,
+      direction:
+          direction,
+      braking:
+          braking,
+      gpsAccuracy:
+          gpsAccuracyMeters.isFinite
+              ? gpsAccuracyMeters
+              : 0,
+      gpsTimestamp:
+          lastGpsUpdate
+              ?.millisecondsSinceEpoch ??
+          now.millisecondsSinceEpoch,
     );
   }
 
@@ -2006,6 +2174,49 @@ class _V2VHomePageState
   }
 
   // =====================================================
+  // LIVE MAP DATA HANDLER
+  // =====================================================
+
+  void _handleLiveMapData(
+    List<dynamic> vehicles,
+  ) {
+    final List<dynamic> cleanedVehicles = [];
+
+    for (final dynamic item in vehicles) {
+      if (item is! Map) {
+        continue;
+      }
+
+      final Map<String, dynamic> vehicle =
+          Map<String, dynamic>.from(item);
+
+      final String id = _getVehicleId(vehicle);
+
+      // The current vehicle is drawn locally with its own GPS marker.
+      if (id.isEmpty || id == vehicleId) {
+        continue;
+      }
+
+      final double? lat = _getVehicleLatitude(vehicle);
+      final double? lng = _getVehicleLongitude(vehicle);
+
+      if (lat == null || lng == null) {
+        continue;
+      }
+
+      cleanedVehicles.add(vehicle);
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      liveMapVehicles = cleanedVehicles;
+    });
+  }
+
+  // =====================================================
   // VEHICLE POSITION UPDATE
   // =====================================================
 
@@ -2094,9 +2305,35 @@ class _V2VHomePageState
 
     _rearmCriticalAlertsFromNearbyVehicles(updated);
 
+    final List<dynamic> updatedMap =
+        List<dynamic>.from(
+      liveMapVehicles,
+    );
+
+    final int mapIndex = updatedMap.indexWhere(
+      (dynamic item) {
+        if (item is! Map) {
+          return false;
+        }
+
+        return _getVehicleId(
+              Map<String, dynamic>.from(item),
+            ) ==
+            incomingId;
+      },
+    );
+
+    if (mapIndex >= 0) {
+      updatedMap[mapIndex] = data;
+    } else {
+      updatedMap.add(data);
+    }
+
     setState(() {
       nearbyVehicles =
           updated;
+      liveMapVehicles =
+          updatedMap;
     });
 
     _evaluateNearbyThreats();
@@ -2140,6 +2377,22 @@ class _V2VHomePageState
 
           return _getVehicleId(
                 vehicle,
+              ) !=
+              removedVehicleId;
+        },
+      ).toList();
+
+      liveMapVehicles =
+          liveMapVehicles.where(
+        (
+          dynamic item,
+        ) {
+          if (item is! Map) {
+            return false;
+          }
+
+          return _getVehicleId(
+                Map<String, dynamic>.from(item),
               ) !=
               removedVehicleId;
         },
@@ -3525,171 +3778,147 @@ class _V2VHomePageState
       safetyStatus,
     );
 
-    return Scaffold(
-      backgroundColor:
-          const Color(
-        0xFFF4F7FF,
-      ),
-      appBar: AppBar(
-        elevation: 0,
-        backgroundColor:
-            const Color(0xFFEEF2FF),
-        surfaceTintColor:
-            Colors.transparent,
-        title: const Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.start,
-          children: [
-            Text(
-              'SMART V2V',
-              style: TextStyle(
-                fontWeight:
-                    FontWeight.bold,
-                fontSize: 20,
+    return DefaultTabController(
+      length: 4,
+      child: Scaffold(
+        backgroundColor: const Color(0xFFF4F7FF),
+        appBar: AppBar(
+          elevation: 0,
+          backgroundColor: const Color(0xFFEEF2FF),
+          surfaceTintColor: Colors.transparent,
+          title: const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'SMART V2V',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 20,
+                ),
               ),
+              Text(
+                'Vehicle-to-Vehicle Communication',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Color(0xFF5B6478),
+                  fontWeight: FontWeight.normal,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            IconButton(
+              tooltip: 'Refresh connection',
+              onPressed:
+                  backendChecking ? null : refreshConnection,
+              icon: backendChecking
+                  ? const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                      ),
+                    )
+                  : const Icon(Icons.refresh),
             ),
-            Text(
-              'Vehicle-to-Vehicle Communication',
-              style: TextStyle(
-                fontSize: 11,
-                color: Color(0xFF5B6478),
-                fontWeight:
-                    FontWeight.normal,
-              ),
+            IconButton(
+              tooltip: 'Test warning',
+              onPressed: testWarningSound,
+              icon: const Icon(Icons.volume_up),
             ),
           ],
-        ),
-        actions: [
-          IconButton(
-            tooltip:
-                'Refresh connection',
-            onPressed:
-                backendChecking
-                    ? null
-                    : refreshConnection,
-            icon:
-                backendChecking
-                    ? const SizedBox(
-                        width: 22,
-                        height: 22,
-                        child:
-                            CircularProgressIndicator(
-                          strokeWidth: 2,
-                        ),
-                      )
-                    : const Icon(
-                        Icons.refresh,
-                      ),
-          ),
-          IconButton(
-            tooltip:
-                'Test warning',
-            onPressed:
-                testWarningSound,
-            icon: const Icon(
-              Icons.volume_up,
-            ),
-          ),
-        ],
-      ),
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              Color(0xFFF2F6FF),
-              Color(0xFFF8F4FF),
-              Color(0xFFF3FBF8),
-            ],
-          ),
-        ),
-        child: SafeArea(
-          child: RefreshIndicator(
-          onRefresh:
-              refreshConnection,
-          child: ListView(
-            padding:
-                const EdgeInsets.all(
-              16,
-            ),
-            children: [
-              // -------------------------------------------
-              // CONNECTION STATUS
-              // -------------------------------------------
-
-              _buildConnectionStatusCard(),
-
-              const SizedBox(
-                height: 14,
+          bottom: const TabBar(
+            // Keep all sections fixed on screen. This removes the empty
+            // leading space and horizontal sliding of the tab bar.
+            isScrollable: false,
+            labelPadding: EdgeInsets.zero,
+            tabs: [
+              Tab(
+                icon: Icon(Icons.dashboard_outlined),
+                text: 'Overview',
               ),
-
-              // -------------------------------------------
-              // SAFETY STATUS
-              // -------------------------------------------
-
-              _buildSafetyStatusCard(
-                normalizedStatus,
+              Tab(
+                icon: Icon(Icons.directions_car_outlined),
+                text: 'Vehicle',
               ),
-
-              const SizedBox(
-                height: 14,
+              Tab(
+                icon: Icon(Icons.insights_outlined),
+                text: 'Intelligence',
               ),
-
-              // -------------------------------------------
-              // MAP
-              // -------------------------------------------
-
-              _buildMapCard(),
-
-              const SizedBox(
-                height: 14,
-              ),
-
-              // -------------------------------------------
-              // VEHICLE INFORMATION
-              // -------------------------------------------
-
-              _buildVehicleInfoCard(),
-
-              const SizedBox(
-                height: 14,
-              ),
-
-              // -------------------------------------------
-              // TRAFFIC
-              // -------------------------------------------
-
-              _buildTrafficCard(),
-
-              const SizedBox(
-                height: 14,
-              ),
-
-              // -------------------------------------------
-              // NEARBY VEHICLES
-              // -------------------------------------------
-
-              _buildNearbyVehiclesCard(),
-
-              const SizedBox(
-                height: 14,
-              ),
-
-              // -------------------------------------------
-              // CONTROLS
-              // -------------------------------------------
-
-              _buildControlsCard(),
-
-              const SizedBox(
-                height: 30,
+              Tab(
+                icon: Icon(Icons.tune_outlined),
+                text: 'Controls',
               ),
             ],
           ),
         ),
+        body: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                Color(0xFFF2F6FF),
+                Color(0xFFF8F4FF),
+                Color(0xFFF3FBF8),
+              ],
+            ),
+          ),
+          child: SafeArea(
+            top: false,
+            child: RefreshIndicator(
+              onRefresh: refreshConnection,
+              child: TabBarView(
+                // Change sections only by tapping the tabs; disable
+                // horizontal swipe/slide between pages.
+                physics: NeverScrollableScrollPhysics(),
+                children: [
+                  ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      _buildConnectionStatusCard(),
+                      const SizedBox(height: 14),
+                      _buildGpsStatusCard(),
+                      const SizedBox(height: 14),
+                      _buildSafetyStatusCard(normalizedStatus),
+                      const SizedBox(height: 30),
+                    ],
+                  ),
+                  ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      _buildVehicleInfoCard(),
+                      const SizedBox(height: 30),
+                    ],
+                  ),
+                  ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      _buildTrafficCard(),
+                      const SizedBox(height: 14),
+                      _buildNearbyVehiclesCard(),
+                      const SizedBox(height: 14),
+                      _buildMapCard(),
+                      const SizedBox(height: 30),
+                    ],
+                  ),
+                  ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      _buildControlsCard(),
+                      const SizedBox(height: 30),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
-    ),
     );
   }
 
@@ -3849,6 +4078,246 @@ class _V2VHomePageState
           ),
         ),
       ],
+    );
+  }
+
+
+  // =====================================================
+  // GPS STATUS CARD
+  // =====================================================
+
+  String _gpsQualityLabel() {
+    if (!gpsConnected || gpsAccuracyMeters >= 999) {
+      return 'Waiting for GPS';
+    }
+    if (gpsAccuracyMeters <= 10) {
+      return 'Excellent';
+    }
+    if (gpsAccuracyMeters <= 20) {
+      return 'Good';
+    }
+    if (gpsAccuracyMeters <= 50) {
+      return 'Weak';
+    }
+    return 'Poor';
+  }
+
+  Color _gpsQualityColor() {
+    if (!gpsConnected || gpsAccuracyMeters >= 999) {
+      return Colors.grey;
+    }
+    if (gpsAccuracyMeters <= 20) {
+      return Colors.green;
+    }
+    if (gpsAccuracyMeters <= 50) {
+      return Colors.orange;
+    }
+    return Colors.red;
+  }
+
+  String _lastGpsUpdateLabel() {
+    if (lastGpsUpdate == null) {
+      return 'No location fix yet';
+    }
+
+    final Duration age = DateTime.now().difference(lastGpsUpdate!);
+
+    if (age.inSeconds < 5) {
+      return 'Just now';
+    }
+    if (age.inSeconds < 60) {
+      return '${age.inSeconds}s ago';
+    }
+    if (age.inMinutes < 60) {
+      return '${age.inMinutes} min ago';
+    }
+    return '${age.inHours}h ago';
+  }
+
+  Widget _buildGpsStatusCard() {
+    final Color qualityColor = _gpsQualityColor();
+    final bool hasFix =
+        gpsConnected && gpsAccuracyMeters.isFinite && gpsAccuracyMeters < 999;
+
+    final String accuracyText = hasFix
+        ? '±${gpsAccuracyMeters.toStringAsFixed(1)} m'
+        : 'Waiting';
+
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 42,
+                  height: 42,
+                  decoration: BoxDecoration(
+                    color: qualityColor.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(13),
+                  ),
+                  child: Icon(
+                    Icons.gps_fixed_rounded,
+                    color: qualityColor,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text(
+                    'GPS Status',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: qualityColor.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    _gpsQualityLabel().toUpperCase(),
+                    style: TextStyle(
+                      color: qualityColor,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: _buildGpsMetric(
+                    icon: Icons.my_location_rounded,
+                    label: 'Accuracy',
+                    value: accuracyText,
+                    color: qualityColor,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _buildGpsMetric(
+                    icon: Icons.schedule_rounded,
+                    label: 'Last Update',
+                    value: _lastGpsUpdateLabel(),
+                    color: gpsConnected ? Colors.blue : Colors.grey,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: _buildGpsMetric(
+                    icon: Icons.north_rounded,
+                    label: 'Latitude',
+                    value: hasFix
+                        ? latitude.toStringAsFixed(6)
+                        : '--',
+                    color: Colors.indigo,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _buildGpsMetric(
+                    icon: Icons.east_rounded,
+                    label: 'Longitude',
+                    value: hasFix
+                        ? longitude.toStringAsFixed(6)
+                        : '--',
+                    color: Colors.indigo,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: qualityColor.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    gpsConnected
+                        ? Icons.check_circle_rounded
+                        : Icons.info_outline_rounded,
+                    color: qualityColor,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      gpsConnected
+                          ? 'GPS is active. Lower accuracy values mean a more precise location.'
+                          : 'Waiting for a reliable GPS location. Move outdoors if needed.',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGpsMetric({
+    required IconData icon,
+    required String label,
+    required String value,
+    required Color color,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade50,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: color),
+          const SizedBox(height: 7),
+          Text(
+            label,
+            style: TextStyle(
+              color: Colors.grey.shade700,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -4110,7 +4579,7 @@ class _V2VHomePageState
                 ),
                 const Spacer(),
                 Text(
-                  '${nearbyVehicles.length} nearby',
+                  '${liveMapVehicles.length} active',
                   style: TextStyle(
                     fontSize: 12,
                     color:
@@ -4173,7 +4642,7 @@ class _V2VHomePageState
     );
 
     for (final dynamic item
-        in nearbyVehicles) {
+        in liveMapVehicles) {
       if (item is! Map) {
         continue;
       }
@@ -4203,12 +4672,6 @@ class _V2VHomePageState
           _distanceFromVehicle(
         vehicle,
       );
-
-      // Extra UI safety gate: never place a marker outside 100 m.
-      if (!distance.isFinite ||
-          distance > _nearbyVehicleDisplayRadiusMeters) {
-        continue;
-      }
 
       final String status =
           _calculateLocalRiskStatus(
@@ -4318,106 +4781,248 @@ class _V2VHomePageState
   // =====================================================
 
   Widget _buildVehicleInfoCard() {
+    final String displayName =
+        vehicleName.isEmpty ? 'My $vehicleType' : vehicleName;
+
     return Card(
       elevation: 2,
+      clipBehavior: Clip.antiAlias,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(20),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
+            Row(
+              children: [
+                Container(
+                  width: 46,
+                  height: 46,
+                  decoration: BoxDecoration(
+                    color: Colors.indigo.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Icon(
+                    _vehicleIcon(vehicleType),
+                    color: Colors.indigo,
+                    size: 26,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text(
+                    'My Vehicle',
+                    style: TextStyle(
+                      fontSize: 21,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Edit Vehicle Details',
+                  onPressed: _showVehicleSettingsDialog,
+                  icon: const Icon(Icons.edit_rounded),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 20),
+
+            Text(
+              displayName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+
+            const SizedBox(height: 6),
+
+            Row(
               children: [
                 Icon(
-                  Icons.person_pin_circle_rounded,
+                  Icons.badge_outlined,
+                  size: 17,
+                  color: Colors.blueGrey,
                 ),
-                SizedBox(width: 8),
-                Text(
-                  'My Vehicle',
-                  style: TextStyle(
-                    fontSize: 17,
-                    fontWeight: FontWeight.bold,
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    vehicleId,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.blueGrey,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.indigo.withValues(alpha: 0.10),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    vehicleType,
+                    style: const TextStyle(
+                      color: Colors.indigo,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
               ],
             ),
 
+            const SizedBox(height: 18),
+            const Divider(height: 1),
             const SizedBox(height: 16),
 
-            _buildInfoRow(
-              icon: Icons.drive_file_rename_outline,
-              label: 'Vehicle Name',
-              value: vehicleName.isEmpty
-                  ? 'My $vehicleType'
-                  : vehicleName,
+            Row(
+              children: [
+                Expanded(
+                  child: _buildVehicleMetric(
+                    icon: Icons.speed_rounded,
+                    label: 'Speed',
+                    value: '${speed.toStringAsFixed(1)} km/h',
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _buildVehicleMetric(
+                    icon: Icons.explore_rounded,
+                    label: 'Direction',
+                    value: '${direction.toStringAsFixed(1)}°',
+                  ),
+                ),
+              ],
             ),
 
-            const SizedBox(height: 10),
+            const SizedBox(height: 12),
 
-            _buildInfoRow(
-              icon: Icons.badge_rounded,
-              label: 'Vehicle ID',
-              value: vehicleId,
+            Row(
+              children: [
+                Expanded(
+                  child: _buildVehicleMetric(
+                    icon: Icons.location_on_rounded,
+                    label: 'GPS',
+                    value:
+                        '${latitude.toStringAsFixed(4)}, '
+                        '${longitude.toStringAsFixed(4)}',
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _buildVehicleMetric(
+                    icon: braking
+                        ? Icons.warning_rounded
+                        : Icons.check_circle_rounded,
+                    label: 'Braking',
+                    value: braking ? 'YES' : 'NO',
+                    valueColor:
+                        braking ? Colors.orange : Colors.green,
+                  ),
+                ),
+              ],
             ),
 
-            const SizedBox(height: 10),
+            const SizedBox(height: 18),
 
-            _buildInfoRow(
-              icon: Icons.two_wheeler_rounded,
-              label: 'Type',
-              value: vehicleType,
-            ),
-
-            const SizedBox(height: 10),
-
-            _buildInfoRow(
-              icon: Icons.speed_rounded,
-              label: 'Speed',
-              value:
-                  '${speed.toStringAsFixed(1)} km/h',
-            ),
-
-            const SizedBox(height: 10),
-
-            _buildInfoRow(
-              icon: Icons.explore_rounded,
-              label: 'Direction',
-              value:
-                  '${direction.toStringAsFixed(1)}°',
-            ),
-
-            const SizedBox(height: 10),
-
-            _buildInfoRow(
-              icon: Icons.location_on_rounded,
-              label: 'GPS',
-              value:
-                  '${latitude.toStringAsFixed(6)}, '
-                  '${longitude.toStringAsFixed(6)}',
-            ),
-
-            const SizedBox(height: 10),
-
-            _buildInfoRow(
-              icon: braking
-                  ? Icons.warning_rounded
-                  : Icons.check_circle_rounded,
-              label: 'Braking',
-              value:
-                  braking ? 'YES' : 'NO',
-              valueColor:
-                  braking
-                      ? Colors.orange
-                      : Colors.green,
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _showVehicleSettingsDialog,
+                icon: const Icon(Icons.edit_rounded),
+                label: const Text('Edit Vehicle Details'),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(46),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+              ),
             ),
           ],
         ),
       ),
     );
   }
+
+  Widget _buildVehicleMetric({
+    required IconData icon,
+    required String label,
+    required String value,
+    Color? valueColor,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            icon,
+            size: 22,
+            color: Colors.blueGrey,
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Colors.blueGrey,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    color: valueColor,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  IconData _vehicleIcon(String type) {
+    switch (type.toLowerCase()) {
+      case 'bike':
+        return Icons.two_wheeler_rounded;
+      case 'bus':
+        return Icons.directions_bus_rounded;
+      case 'truck':
+        return Icons.local_shipping_rounded;
+      case 'ambulance':
+        return Icons.emergency_rounded;
+      case 'car':
+      default:
+        return Icons.directions_car_filled_rounded;
+    }
+  }
+
 
   // =====================================================
   // GENERIC INFORMATION ROW
