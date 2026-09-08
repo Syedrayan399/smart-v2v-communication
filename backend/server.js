@@ -14,22 +14,18 @@ const PORT = Number(process.env.PORT || 3000);
 // IMPORTANT:
 // This is NOT your ngrok authtoken.
 //
-// Optional shared secret for V2V authentication.
+// Set this only if you want V2V authentication.
 //
-// PowerShell example:
+// Windows PowerShell example:
+//
 // $env:V2V_SHARED_SECRET="my_secret"
 // node backend/server.js
 //
-// Leave empty to disable authentication for testing.
-const V2V_SHARED_SECRET = (
-  process.env.V2V_SHARED_SECRET || ""
-).trim();
+// Leave empty to disable authentication for local testing.
+const V2V_SHARED_SECRET =
+  (process.env.V2V_SHARED_SECRET || "").trim();
 
 const DETECTION_RADIUS_METERS = 200;
-
-// =====================================================
-// HTTP / CORS
-// =====================================================
 
 const appCorsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -58,12 +54,7 @@ app.use((request, response, next) => {
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: [
-      "GET",
-      "POST",
-      "DELETE",
-      "OPTIONS",
-    ],
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
@@ -71,10 +62,7 @@ const io = new Server(server, {
     ],
   },
 
-  transports: [
-    "polling",
-    "websocket",
-  ],
+  transports: ["polling", "websocket"],
 
   allowUpgrades: true,
 
@@ -120,11 +108,16 @@ function getHttpToken(request) {
   const customToken =
     request.headers["x-v2v-token"];
 
-  // FIX:
-  // JavaScript does NOT have Dart's `.isNotEmpty`.
   if (
     typeof customToken === "string" &&
-    customToken.trim().length > 0
+    customToken.trim().isNotEmpty !== true
+  ) {
+    // Kept below through normal logic.
+  }
+
+  if (
+    typeof customToken === "string" &&
+    customToken.trim()
   ) {
     return customToken.trim();
   }
@@ -150,6 +143,7 @@ function requireHttpAuth(
   next
 ) {
   // Authentication is optional.
+
   if (!V2V_SHARED_SECRET) {
     return next();
   }
@@ -176,6 +170,7 @@ function requireHttpAuth(
 
 io.use((socket, next) => {
   // Authentication is optional.
+
   if (!V2V_SHARED_SECRET) {
     return next();
   }
@@ -188,10 +183,9 @@ io.use((socket, next) => {
 
   const token =
     typeof authToken === "string" &&
-    authToken.trim().length > 0
+    authToken.trim()
       ? authToken.trim()
-      : typeof queryToken === "string" &&
-        queryToken.trim().length > 0
+      : typeof queryToken === "string"
       ? queryToken.trim()
       : "";
 
@@ -273,7 +267,8 @@ function calculateDistanceMeters(
   const a =
     Math.sin(
       latitudeDifference / 2
-    ) ** 2 +
+    ) **
+      2 +
     Math.cos(
       toRadians(lat1)
     ) *
@@ -282,7 +277,8 @@ function calculateDistanceMeters(
       ) *
       Math.sin(
         longitudeDifference / 2
-      ) ** 2;
+      ) **
+        2;
 
   const c =
     2 *
@@ -291,7 +287,9 @@ function calculateDistanceMeters(
       Math.sqrt(1 - a)
     );
 
-  return earthRadius * c;
+  return (
+    earthRadius * c
+  );
 }
 
 // =====================================================
@@ -718,46 +716,53 @@ function broadcastVehicleData() {
     const risk =
       primaryThreat.risk;
 
-    io.to(
-      ownVehicle.socketId
-    ).emit(
-      "collisionWarning",
-      {
-        warning:
-          risk === "CRITICAL" ||
-          risk === "HIGH",
+    if (
+      risk === "CRITICAL" ||
+      risk === "HIGH" ||
+      risk === "MEDIUM" ||
+      risk === "EARLY"
+    ) {
+      io.to(
+        ownVehicle.socketId
+      ).emit(
+        "collisionWarning",
+        {
+          warning:
+            risk === "CRITICAL" ||
+            risk === "HIGH",
 
-        level: risk,
+          level: risk,
 
-        risk,
+          risk,
 
-        vehicle:
-          primaryThreat,
+          vehicle:
+            primaryThreat,
 
-        vehicleId:
-          primaryThreat.vehicleId,
+          vehicleId:
+            primaryThreat.vehicleId,
 
-        id:
-          primaryThreat.vehicleId,
+          id:
+            primaryThreat.vehicleId,
 
-        distance:
-          primaryThreat.distance,
+          distance:
+            primaryThreat.distance,
 
-        speed:
-          primaryThreat.speed,
+          speed:
+            primaryThreat.speed,
 
-        braking:
-          primaryThreat.braking ===
-          true,
+          braking:
+            primaryThreat.braking ===
+            true,
 
-        message:
-          createWarningMessage(
-            primaryThreat
-          ),
+          message:
+            createWarningMessage(
+              primaryThreat
+            ),
 
-        trafficDensity,
-      }
-    );
+          trafficDensity,
+        }
+      );
+    }
   }
 }
 
@@ -942,7 +947,8 @@ function stopAllSimulations() {
   stopSingleSimulation();
   stopTrafficSimulation();
 
-  simulationActive = false;
+  simulationActive =
+    false;
 
   updateAllClients();
 }
@@ -1037,7 +1043,6 @@ function startSingleSimulation() {
           !target
         ) {
           stopSingleSimulation();
-          updateAllClients();
           return;
         }
 
@@ -1079,7 +1084,8 @@ function startSingleSimulation() {
       1000
     );
 
-  simulationActive = true;
+  simulationActive =
+    true;
 
   updateAllClients();
 
@@ -1262,12 +1268,14 @@ function startTrafficSimulation(
           vehicle.latitude +=
             Math.cos(
               radians
-            ) * movement;
+            ) *
+            movement;
 
           vehicle.longitude +=
             Math.sin(
               radians
-            ) * movement;
+            ) *
+            movement;
 
           if (
             Math.random() <
@@ -1294,7 +1302,8 @@ function startTrafficSimulation(
                     (
                       Math.random() -
                       0.5
-                    ) * 4
+                    ) *
+                      4
                 )
               );
           }
@@ -1310,7 +1319,8 @@ function startTrafficSimulation(
       1000
     );
 
-  simulationActive = true;
+  simulationActive =
+    true;
 
   updateAllClients();
 
@@ -1580,8 +1590,8 @@ io.on(
             vehicleId
           );
 
-        // Same vehicle reconnecting:
-        // replace the old socket ownership.
+        // If the same vehicle reconnects, replace
+        // the old socket ownership.
         if (
           previousVehicle &&
           previousVehicle.socketId &&
@@ -1691,8 +1701,6 @@ io.on(
           return;
         }
 
-        // Prevent another socket from updating
-        // a vehicle it does not own.
         if (
           vehicle.socketId !==
           socket.id

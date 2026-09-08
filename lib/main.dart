@@ -8,6 +8,7 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
 
 import 'v2v_service.dart';
@@ -116,7 +117,91 @@ class _V2VHomePageState
   final String vehicleId =
       'BIKE${100000 + Random.secure().nextInt(900000)}';
 
-  final String vehicleType = 'Bike';
+  // User-selected vehicle details. The ID remains unique for backend/V2V
+  // communication, while the name is a friendly label shown in the app.
+  String vehicleName = '';
+
+  String vehicleType = 'Bike';
+
+  static const List<String> _vehicleTypes = <String>[
+    'Bike',
+    'Car',
+    'Bus',
+    'Truck',
+    'Ambulance',
+  ];
+
+
+  // =====================================================
+  // SAVED VEHICLE INFORMATION
+  // =====================================================
+
+  static const String _vehicleNamePreferenceKey =
+      'saved_vehicle_name';
+  static const String _vehicleTypePreferenceKey =
+      'saved_vehicle_type';
+  static const String _vehicleSetupCompletePreferenceKey =
+      'vehicle_setup_complete';
+
+  Future<bool> _loadSavedVehicleDetails() async {
+    final SharedPreferences preferences =
+        await SharedPreferences.getInstance();
+
+    final bool setupComplete =
+        preferences.getBool(
+          _vehicleSetupCompletePreferenceKey,
+        ) ??
+        false;
+
+    if (!setupComplete) {
+      return false;
+    }
+
+    final String savedName =
+        preferences.getString(
+          _vehicleNamePreferenceKey,
+        ) ??
+        '';
+
+    final String savedType =
+        preferences.getString(
+          _vehicleTypePreferenceKey,
+        ) ??
+        'Bike';
+
+    if (!mounted) {
+      return false;
+    }
+
+    setState(() {
+      vehicleName = savedName;
+      vehicleType = _vehicleTypes.contains(savedType)
+          ? savedType
+          : 'Bike';
+    });
+
+    return true;
+  }
+
+  Future<void> _saveVehicleDetails() async {
+    final SharedPreferences preferences =
+        await SharedPreferences.getInstance();
+
+    await preferences.setString(
+      _vehicleNamePreferenceKey,
+      vehicleName,
+    );
+
+    await preferences.setString(
+      _vehicleTypePreferenceKey,
+      vehicleType,
+    );
+
+    await preferences.setBool(
+      _vehicleSetupCompletePreferenceKey,
+      true,
+    );
+  }
 
   // =====================================================
   // LOCATION
@@ -155,8 +240,15 @@ class _V2VHomePageState
   // Only trust a fix for critical alerts when accuracy is this good or better.
   static const double _maxAccuracyForCriticalAlert = 20.0;
 
-  // Completely ignore (do not update position) fixes worse than this.
-  static const double _maxAccuracyToAccept = 80.0;
+  // Completely ignore fixes worse than this. Keeping this tighter reduces
+  // large indoor GPS jumps from being broadcast to nearby vehicles.
+  static const double _maxAccuracyToAccept = 20.0;
+
+  // Smooth accepted GPS fixes before using them for map/V2V distance logic.
+  // This reduces 80 m -> 20 m -> 5 m style jumps caused by noisy GPS fixes.
+  static const int _locationSmoothingWindow = 5;
+  final List<Position> _recentAccuratePositions = <Position>[];
+
 
   // =====================================================
   // V2V STATUS
@@ -253,6 +345,9 @@ class _V2VHomePageState
   // =====================================================
 
   List<dynamic> nearbyVehicles = [];
+
+  // Only vehicles within this radius are kept and displayed.
+  static const double _nearbyVehicleDisplayRadiusMeters = 100.0;
 
   // =====================================================
   // TRAFFIC DENSITY
@@ -977,6 +1072,117 @@ class _V2VHomePageState
   }
 
   // =====================================================
+  // VEHICLE SETUP
+  // =====================================================
+
+  Future<void> _showVehicleSetupDialog() async {
+    String selectedType = vehicleType;
+    String enteredName = vehicleName;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
+        return StatefulBuilder(
+          builder: (
+            BuildContext context,
+            StateSetter setDialogState,
+          ) {
+            return AlertDialog(
+              title: const Text('Set Up Your Vehicle'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Enter a name and select the type of vehicle you are using.',
+                    ),
+                    const SizedBox(height: 18),
+                    TextFormField(
+                      initialValue: vehicleName,
+                      textCapitalization: TextCapitalization.words,
+                      maxLength: 30,
+                      onChanged: (String value) {
+                        enteredName = value;
+                      },
+                      decoration: const InputDecoration(
+                        labelText: 'Vehicle Name',
+                        hintText: 'Example: Rayan Bike',
+                        prefixIcon: Icon(Icons.drive_file_rename_outline),
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      value: selectedType,
+                      decoration: const InputDecoration(
+                        labelText: 'Vehicle Type',
+                        prefixIcon: Icon(Icons.directions_car_filled_rounded),
+                        border: OutlineInputBorder(),
+                      ),
+                      items: _vehicleTypes
+                          .map(
+                            (String type) => DropdownMenuItem<String>(
+                              value: type,
+                              child: Text(type),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (String? value) {
+                        if (value != null) {
+                          setDialogState(() {
+                            selectedType = value;
+                          });
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                FilledButton(
+                  onPressed: () async {
+                    // If the user typed a name and left the default Bike type,
+                    // the text field may still own focus. Release that focus
+                    // before removing the dialog.
+                    FocusManager.instance.primaryFocus?.unfocus();
+
+                    await Future<void>.delayed(
+                      const Duration(milliseconds: 150),
+                    );
+
+                    if (!dialogContext.mounted || !mounted) {
+                      return;
+                    }
+
+                    setState(() {
+                      final String trimmedName =
+                          enteredName.trim();
+
+                      vehicleName = trimmedName.isEmpty
+                          ? 'My $selectedType'
+                          : trimmedName;
+                      vehicleType = selectedType;
+                    });
+
+                    await _saveVehicleDetails();
+
+                    if (dialogContext.mounted) {
+                      Navigator.of(dialogContext).pop();
+                    }
+                  },
+                  child: const Text('Start V2V'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // =====================================================
   // APP LIFECYCLE
   // =====================================================
 
@@ -990,8 +1196,17 @@ class _V2VHomePageState
 
     WidgetsBinding.instance
         .addPostFrameCallback(
-      (_) {
-        allowLocation();
+      (_) async {
+        final bool hasSavedVehicle =
+            await _loadSavedVehicleDetails();
+
+        if (!hasSavedVehicle && mounted) {
+          await _showVehicleSetupDialog();
+        }
+
+        if (mounted) {
+          allowLocation();
+        }
       },
     );
   }
@@ -1295,10 +1510,11 @@ class _V2VHomePageState
       );
 
       final Position position = await Geolocator.getCurrentPosition(
-  locationSettings: const LocationSettings(
-    accuracy: LocationAccuracy.best,
-  ),
-);
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.bestForNavigation,
+          timeLimit: Duration(seconds: 8),
+        ),
+      );
 
       _updateOwnPosition(
         position,
@@ -1421,6 +1637,52 @@ class _V2VHomePageState
       return;
     }
 
+    // ---- GPS smoothing --------------------------------------------------
+    // Keep a short window of only good fixes and use an accuracy-weighted
+    // average. More accurate fixes influence the result more strongly.
+    _recentAccuratePositions.add(position);
+    if (_recentAccuratePositions.length > _locationSmoothingWindow) {
+      _recentAccuratePositions.removeAt(0);
+    }
+
+    double totalWeight = 0;
+    double smoothedLatitude = 0;
+    double smoothedLongitude = 0;
+
+    for (final Position sample in _recentAccuratePositions) {
+      final double sampleAccuracy =
+          sample.accuracy.isFinite && sample.accuracy > 0
+              ? sample.accuracy
+              : _maxAccuracyToAccept;
+      final double weight = 1 / (sampleAccuracy * sampleAccuracy);
+      totalWeight += weight;
+      smoothedLatitude += sample.latitude * weight;
+      smoothedLongitude += sample.longitude * weight;
+    }
+
+    if (totalWeight > 0) {
+      smoothedLatitude /= totalWeight;
+      smoothedLongitude /= totalWeight;
+    } else {
+      smoothedLatitude = position.latitude;
+      smoothedLongitude = position.longitude;
+    }
+
+    final Position filteredPosition = Position(
+      latitude: smoothedLatitude,
+      longitude: smoothedLongitude,
+      timestamp: position.timestamp,
+      accuracy: accuracy,
+      altitude: position.altitude,
+      altitudeAccuracy: position.altitudeAccuracy,
+      heading: position.heading,
+      headingAccuracy: position.headingAccuracy,
+      speed: position.speed,
+      speedAccuracy: position.speedAccuracy,
+      isMocked: position.isMocked,
+    );
+
+
     final double newSpeedKmh =
         position.speed.isFinite &&
                 position.speed > 0
@@ -1447,10 +1709,10 @@ class _V2VHomePageState
 
     setState(() {
       latitude =
-          position.latitude;
+          filteredPosition.latitude;
 
       longitude =
-          position.longitude;
+          filteredPosition.longitude;
 
       speed =
           newSpeedKmh;
@@ -1618,6 +1880,16 @@ class _V2VHomePageState
     return double.infinity;
   }
 
+  // Returns true only for vehicles within the 100 m display radius.
+  bool _isWithinDisplayRadius(
+    Map<String, dynamic> vehicle,
+  ) {
+    final double distance = _distanceFromVehicle(vehicle);
+
+    return distance.isFinite &&
+        distance <= _nearbyVehicleDisplayRadiusMeters;
+  }
+
   // =====================================================
   // TRAFFIC DENSITY HANDLING
   // =====================================================
@@ -1700,6 +1972,11 @@ class _V2VHomePageState
         continue;
       }
 
+      // Display and process only vehicles within 100 metres.
+      if (!_isWithinDisplayRadius(vehicle)) {
+        continue;
+      }
+
       cleanedVehicles.add(
         vehicle,
       );
@@ -1742,6 +2019,34 @@ class _V2VHomePageState
 
     if (incomingId.isEmpty ||
         incomingId == vehicleId) {
+      return;
+    }
+
+    // Remove vehicles that have moved outside the 100 m radius.
+    if (!_isWithinDisplayRadius(data)) {
+      final List<dynamic> filtered =
+          nearbyVehicles.where((dynamic item) {
+        if (item is! Map) {
+          return false;
+        }
+
+        final Map<String, dynamic> vehicle =
+            Map<String, dynamic>.from(item);
+
+        return _getVehicleId(vehicle) != incomingId;
+      }).toList();
+
+      if (!mounted) {
+        return;
+      }
+
+      _rearmCriticalAlertsFromNearbyVehicles(filtered);
+
+      setState(() {
+        nearbyVehicles = filtered;
+      });
+
+      _evaluateNearbyThreats();
       return;
     }
 
@@ -3899,6 +4204,12 @@ class _V2VHomePageState
         vehicle,
       );
 
+      // Extra UI safety gate: never place a marker outside 100 m.
+      if (!distance.isFinite ||
+          distance > _nearbyVehicleDisplayRadiusMeters) {
+        continue;
+      }
+
       final String status =
           _calculateLocalRiskStatus(
         vehicle,
@@ -4035,6 +4346,16 @@ class _V2VHomePageState
             ),
 
             const SizedBox(height: 16),
+
+            _buildInfoRow(
+              icon: Icons.drive_file_rename_outline,
+              label: 'Vehicle Name',
+              value: vehicleName.isEmpty
+                  ? 'My $vehicleType'
+                  : vehicleName,
+            ),
+
+            const SizedBox(height: 10),
 
             _buildInfoRow(
               icon: Icons.badge_rounded,
