@@ -27,10 +27,10 @@ const V2V_SHARED_SECRET =
 
 // Maximum distance for showing another vehicle
 // in the Nearby Vehicles section.
-const DETECTION_RADIUS_METERS = 200;
+const DETECTION_RADIUS_METERS = 100;
 
 // Distance used for warning / danger detection.
-const WARNING_RADIUS_METERS = 50;
+const WARNING_RADIUS_METERS = 5;
 
 // A vehicle is considered stale when it has not
 // sent a GPS update within this time.
