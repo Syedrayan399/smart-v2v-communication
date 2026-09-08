@@ -3,19 +3,15 @@ const http = require("http");
 const { Server } = require("socket.io");
 
 const app = express();
-
 const server = http.createServer(app);
 
 // =====================================================
 // CONFIGURATION
 // =====================================================
 
-const PORT = Number(
-  process.env.PORT || 3000
-);
+const PORT = Number(process.env.PORT || 3000);
 
 // IMPORTANT:
-//
 // This is NOT your ngrok authtoken.
 //
 // Set this only if you want V2V authentication.
@@ -26,43 +22,24 @@ const PORT = Number(
 // node backend/server.js
 //
 // Leave empty to disable authentication for local testing.
-
 const V2V_SHARED_SECRET =
-  (
-    process.env.V2V_SHARED_SECRET ||
-    ""
-  ).trim();
+  (process.env.V2V_SHARED_SECRET || "").trim();
 
-// =====================================================
-// V2V DISTANCE SETTINGS
-// =====================================================
+// Maximum distance for showing another vehicle
+// in the Nearby Vehicles section.
+const DETECTION_RADIUS_METERS = 200;
 
-// Vehicles are detected and displayed in
-// Nearby Vehicles when they are within
-// 100 meters.
-
-const DETECTION_RADIUS_METERS =
-  100;
-
-// A proximity / collision warning is triggered
-// only when another vehicle is 5 meters or closer.
-
-const WARNING_RADIUS_METERS =
-  5;
+// Distance used for warning / danger detection.
+const WARNING_RADIUS_METERS = 50;
 
 // A vehicle is considered stale when it has not
 // sent a GPS update within this time.
-
-const VEHICLE_STALE_AFTER_MS =
-  15000;
+const VEHICLE_STALE_AFTER_MS = 15000;
 
 const appCorsHeaders = {
-  "Access-Control-Allow-Origin":
-    "*",
-
+  "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods":
     "GET,POST,DELETE,OPTIONS",
-
   "Access-Control-Allow-Headers":
     "Content-Type, Authorization, x-v2v-token",
 };
@@ -73,218 +50,99 @@ app.use(
   })
 );
 
-app.use(
-  (
-    request,
-    response,
-    next
-  ) => {
-    response.set(
-      appCorsHeaders
-    );
+app.use((request, response, next) => {
+  response.set(appCorsHeaders);
 
-    if (
-      request.method ===
-      "OPTIONS"
-    ) {
-      return response.sendStatus(
-        204
-      );
-    }
-
-    next();
+  if (request.method === "OPTIONS") {
+    return response.sendStatus(204);
   }
-);
+
+  next();
+});
 
 // =====================================================
 // SOCKET.IO
 // =====================================================
 
-const io = new Server(
-  server,
-  {
-    cors: {
-      origin: "*",
+const io = new Server(server, {
+  cors: {
+    origin: "*",
 
-      methods: [
-        "GET",
-        "POST",
-        "DELETE",
-        "OPTIONS",
-      ],
-
-      allowedHeaders: [
-        "Content-Type",
-        "Authorization",
-        "x-v2v-token",
-      ],
-    },
-
-    transports: [
-      "polling",
-      "websocket",
+    methods: [
+      "GET",
+      "POST",
+      "DELETE",
+      "OPTIONS",
     ],
 
-    allowUpgrades: true,
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "x-v2v-token",
+    ],
+  },
 
-    pingInterval:
-      10000,
+  transports: [
+    "polling",
+    "websocket",
+  ],
 
-    pingTimeout:
-      30000,
+  allowUpgrades: true,
 
-    allowEIO3: true,
-  }
-);
+  pingInterval: 10000,
+
+  pingTimeout: 30000,
+
+  allowEIO3: true,
+});
 
 // =====================================================
 // VEHICLE STORAGE
 // =====================================================
 
 // Stores all connected and simulated vehicles.
+const vehicles = new Map();
 
-const vehicles =
-  new Map();
+let singleSimulationTimer = null;
 
-// =====================================================
-// ONE-TIME WARNING TRACKING
-// =====================================================
+let trafficSimulationTimer = null;
 
-// Stores vehicle pairs that have already received
-// a warning while they remain inside the
-// 5 meter warning radius.
-//
-// Example:
-//
-// CAR001::BIKE002
-//
-// The IDs are sorted so:
-//
-// CAR001 + BIKE002
-//
-// and:
-//
-// BIKE002 + CAR001
-//
-// always produce the same pair key.
+let singleSimulationVehicleId = null;
 
-const activeWarningPairs =
-  new Set();
+let trafficSimulationIds = [];
 
-// Create a consistent key for two vehicles.
-
-function warningPairKey(
-  firstVehicleId,
-  secondVehicleId
-) {
-  return [
-    String(
-      firstVehicleId
-    ),
-
-    String(
-      secondVehicleId
-    ),
-  ]
-    .sort()
-    .join(
-      "::"
-    );
-}
-
-// Remove every warning state associated
-// with a vehicle.
-//
-// This is used when a vehicle disconnects,
-// is deleted, or otherwise removed.
-
-function clearWarningPairsForVehicle(
-  vehicleId
-) {
-  const id =
-    String(
-      vehicleId
-    );
-
-  for (
-    const key
-    of activeWarningPairs
-  ) {
-    const pair =
-      key.split(
-        "::"
-      );
-
-    if (
-      pair[0] === id ||
-      pair[1] === id
-    ) {
-      activeWarningPairs.delete(
-        key
-      );
-    }
-  }
-}
-
-let singleSimulationTimer =
-  null;
-
-let trafficSimulationTimer =
-  null;
-
-let singleSimulationVehicleId =
-  null;
-
-let trafficSimulationIds =
-  [];
-
-let simulationActive =
-  false;
+let simulationActive = false;
 
 // =====================================================
 // ROOT
 // =====================================================
 
-app.get(
-  "/",
-  (
-    _request,
-    response
-  ) => {
-    response.json({
-      project:
-        "SMART V2V COMMUNICATION",
+app.get("/", (_request, response) => {
+  response.json({
+    project: "SMART V2V COMMUNICATION",
 
-      status:
-        "Backend Running",
+    status: "Backend Running",
 
-      service:
-        "V2V Socket.IO",
+    service: "V2V Socket.IO",
 
-      detectionRadius:
-        DETECTION_RADIUS_METERS,
+    detectionRadius:
+      DETECTION_RADIUS_METERS,
 
-      warningRadius:
-        WARNING_RADIUS_METERS,
-    });
-  }
-);
+    warningRadius:
+      WARNING_RADIUS_METERS,
+  });
+});
 
 // =====================================================
 // HTTP AUTH
 // =====================================================
 
-function getHttpToken(
-  request
-) {
+function getHttpToken(request) {
   const customToken =
-    request.headers[
-      "x-v2v-token"
-    ];
+    request.headers["x-v2v-token"];
 
   if (
-    typeof customToken ===
-      "string" &&
+    typeof customToken === "string" &&
     customToken.trim()
   ) {
     return customToken.trim();
@@ -294,16 +152,11 @@ function getHttpToken(
     request.headers.authorization;
 
   if (
-    typeof authorization ===
-      "string" &&
-    authorization.startsWith(
-      "Bearer "
-    )
+    typeof authorization === "string" &&
+    authorization.startsWith("Bearer ")
   ) {
     return authorization
-      .substring(
-        "Bearer ".length
-      )
+      .substring("Bearer ".length)
       .trim();
   }
 
@@ -317,29 +170,23 @@ function requireHttpAuth(
 ) {
   // Authentication is optional.
 
-  if (
-    !V2V_SHARED_SECRET
-  ) {
+  if (!V2V_SHARED_SECRET) {
     return next();
   }
 
   const token =
-    getHttpToken(
-      request
-    );
+    getHttpToken(request);
 
   if (
     token !==
     V2V_SHARED_SECRET
   ) {
-    return response
-      .status(401)
-      .json({
-        success: false,
+    return response.status(401).json({
+      success: false,
 
-        message:
-          "Unauthorized",
-      });
+      message:
+        "Unauthorized",
+    });
   }
 
   next();
@@ -349,57 +196,44 @@ function requireHttpAuth(
 // SOCKET AUTH
 // =====================================================
 
-io.use(
-  (
-    socket,
-    next
-  ) => {
-    // Authentication is optional.
+io.use((socket, next) => {
+  // Authentication is optional.
 
-    if (
-      !V2V_SHARED_SECRET
-    ) {
-      return next();
-    }
-
-    const queryToken =
-      socket.handshake.query
-        ?.token;
-
-    const authToken =
-      socket.handshake.auth
-        ?.token;
-
-    const token =
-      typeof authToken ===
-        "string" &&
-      authToken.trim()
-        ? authToken.trim()
-        : typeof queryToken ===
-            "string"
-        ? queryToken.trim()
-        : "";
-
-    if (
-      token !==
-      V2V_SHARED_SECRET
-    ) {
-      console.warn(
-        "SOCKET AUTH REJECTED:",
-        socket.id,
-        socket.handshake.address
-      );
-
-      return next(
-        new Error(
-          "unauthorized"
-        )
-      );
-    }
-
-    next();
+  if (!V2V_SHARED_SECRET) {
+    return next();
   }
-);
+
+  const queryToken =
+    socket.handshake.query?.token;
+
+  const authToken =
+    socket.handshake.auth?.token;
+
+  const token =
+    typeof authToken === "string" &&
+    authToken.trim()
+      ? authToken.trim()
+      : typeof queryToken === "string"
+      ? queryToken.trim()
+      : "";
+
+  if (
+    token !==
+    V2V_SHARED_SECRET
+  ) {
+    console.warn(
+      "SOCKET AUTH REJECTED:",
+      socket.id,
+      socket.handshake.address
+    );
+
+    return next(
+      new Error("unauthorized")
+    );
+  }
+
+  next();
+});
 
 // =====================================================
 // NUMBER HELPER
@@ -410,13 +244,9 @@ function numberValue(
   fallback = 0
 ) {
   const parsed =
-    Number(
-      value
-    );
+    Number(value);
 
-  return Number.isFinite(
-    parsed
-  )
+  return Number.isFinite(parsed)
     ? parsed
     : fallback;
 }
@@ -430,8 +260,7 @@ function normalizeVehicleStatus(
 ) {
   const value =
     String(
-      status ||
-      "ACTIVE"
+      status || "ACTIVE"
     )
       .trim()
       .toUpperCase();
@@ -464,9 +293,7 @@ function isVehicleStale(
       0
     );
 
-  if (
-    !lastUpdate
-  ) {
+  if (!lastUpdate) {
     return true;
   }
 
@@ -488,9 +315,7 @@ function getVehicleStatus(
   }
 
   if (
-    isVehicleStale(
-      vehicle
-    )
+    isVehicleStale(vehicle)
   ) {
     return "OFFLINE";
   }
@@ -503,26 +328,19 @@ function getVehicleStatus(
 function isVehicleAvailableForDetection(
   vehicle
 ) {
-  if (
-    !vehicle
-  ) {
+  if (!vehicle) {
     return false;
   }
 
-  if (
-    vehicle.simulated
-  ) {
+  if (vehicle.simulated) {
     return true;
   }
 
   const status =
-    getVehicleStatus(
-      vehicle
-    );
+    getVehicleStatus(vehicle);
 
   return (
-    status !==
-    "OFFLINE"
+    status !== "OFFLINE"
   );
 }
 
@@ -535,12 +353,8 @@ function isValidCoordinate(
   longitude
 ) {
   return (
-    Number.isFinite(
-      latitude
-    ) &&
-    Number.isFinite(
-      longitude
-    ) &&
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
     latitude >= -90 &&
     latitude <= 90 &&
     longitude >= -180 &&
@@ -562,65 +376,48 @@ function calculateDistanceMeters(
     6371000;
 
   const toRadians =
-    (
-      value
-    ) =>
-      (
-        value *
-        Math.PI
-      ) /
+    (value) =>
+      (value * Math.PI) /
       180;
 
   const latitudeDifference =
     toRadians(
-      lat2 -
-        lat1
+      lat2 - lat1
     );
 
   const longitudeDifference =
     toRadians(
-      lon2 -
-        lon1
+      lon2 - lon1
     );
 
   const a =
     Math.sin(
-      latitudeDifference /
-        2
+      latitudeDifference / 2
     ) **
       2 +
     Math.cos(
-      toRadians(
-        lat1
-      )
+      toRadians(lat1)
     ) *
       Math.cos(
-        toRadians(
-          lat2
-        )
+        toRadians(lat2)
       ) *
       Math.sin(
-        longitudeDifference /
-          2
+        longitudeDifference / 2
       ) **
         2;
 
   const c =
     2 *
     Math.atan2(
-      Math.sqrt(
-        a
-      ),
-      Math.sqrt(
-        1 - a
-      )
+      Math.sqrt(a),
+      Math.sqrt(1 - a)
     );
 
   return (
-    earthRadius *
-    c
+    earthRadius * c
   );
 }
+
 // =====================================================
 // VEHICLE GPS DATA
 // =====================================================
@@ -644,9 +441,7 @@ function buildVehicleGpsData(
       "vehicle",
 
     status:
-      getVehicleStatus(
-        vehicle
-      ),
+      getVehicleStatus(vehicle),
 
     latitude:
       vehicle.latitude,
@@ -684,16 +479,13 @@ function buildVehicleGpsData(
       vehicle.lastUpdate,
 
     stale:
-      isVehicleStale(
-        vehicle
-      ),
+      isVehicleStale(vehicle),
 
     simulated:
       vehicle.simulated ===
       true,
   };
 }
-
 // =====================================================
 // TRAFFIC DENSITY
 // =====================================================
@@ -704,18 +496,12 @@ function calculateTrafficDensity(
   const count =
     vehicleList.length;
 
-  let averageSpeed =
-    0;
+  let averageSpeed = 0;
 
-  if (
-    count > 0
-  ) {
+  if (count > 0) {
     const totalSpeed =
       vehicleList.reduce(
-        (
-          total,
-          vehicle
-        ) =>
+        (total, vehicle) =>
           total +
           numberValue(
             vehicle.speed
@@ -724,33 +510,23 @@ function calculateTrafficDensity(
       );
 
     averageSpeed =
-      totalSpeed /
-      count;
+      totalSpeed / count;
   }
 
-  let density =
-    "LIGHT";
+  let density = "LIGHT";
 
   let congestion =
     false;
 
-  if (
-    count < 10
-  ) {
-    density =
-      "LIGHT";
-  } else if (
-    count < 15
-  ) {
-    density =
-      "MODERATE";
+  if (count < 10) {
+    density = "LIGHT";
+  } else if (count < 15) {
+    density = "MODERATE";
 
     congestion =
-      averageSpeed <
-      15;
+      averageSpeed < 15;
   } else {
-    density =
-      "HEAVY";
+    density = "HEAVY";
 
     congestion =
       true;
@@ -764,9 +540,7 @@ function calculateTrafficDensity(
 
     averageSpeed:
       Number(
-        averageSpeed.toFixed(
-          1
-        )
+        averageSpeed.toFixed(1)
       ),
 
     congestion,
@@ -780,12 +554,10 @@ function calculateTrafficDensity(
 function buildNearbyVehicleData(
   ownVehicle
 ) {
-  const nearbyVehicles =
-    [];
+  const nearbyVehicles = [];
 
-  // Do not calculate nearby vehicles
-  // for an offline / stale real vehicle.
-
+  // Do not calculate nearby vehicles for
+  // an offline / stale real vehicle.
   if (
     !isVehicleAvailableForDetection(
       ownVehicle
@@ -799,7 +571,6 @@ function buildNearbyVehicleData(
     of vehicles.values()
   ) {
     // Ignore own vehicle.
-
     if (
       vehicle.vehicleId ===
       ownVehicle.vehicleId
@@ -808,7 +579,6 @@ function buildNearbyVehicleData(
     }
 
     // Ignore stale / offline vehicles.
-
     if (
       !isVehicleAvailableForDetection(
         vehicle
@@ -826,8 +596,7 @@ function buildNearbyVehicleData(
       );
 
     // Only include vehicles inside
-    // the 100 meter detection radius.
-
+    // the detection radius.
     if (
       distance >
       DETECTION_RADIUS_METERS
@@ -846,9 +615,7 @@ function buildNearbyVehicleData(
 
       distance:
         Number(
-          distance.toFixed(
-            1
-          )
+          distance.toFixed(1)
         ),
 
       withinDetectionRadius:
@@ -866,12 +633,8 @@ function buildNearbyVehicleData(
   }
 
   // Nearest vehicle first.
-
   nearbyVehicles.sort(
-    (
-      first,
-      second
-    ) =>
+    (first, second) =>
       first.distance -
       second.distance
   );
@@ -918,42 +681,48 @@ function calculateCollisionRisk(
   let risk =
     "SAFE";
 
-  // A warning is only eligible inside
-  // the 5 meter warning radius.
-
+  // Critical risk.
   if (
+    distance <= 5 &&
+    nearbySpeed >= 3
+  ) {
+    risk =
+      "CRITICAL";
+  }
+
+  // High risk.
+  else if (
+    distance <= 15 &&
+    nearbySpeed >= 3
+  ) {
+    risk =
+      "HIGH";
+  }
+
+  // Medium risk.
+  else if (
+    distance <= 30 &&
+    speedDifference >= 8
+  ) {
+    risk =
+      "MEDIUM";
+  }
+
+  // Vehicle is inside warning radius.
+  else if (
     distance <=
     WARNING_RADIUS_METERS
   ) {
-    // Critical risk when the vehicle
-    // is very close and moving.
-
-    if (
-      nearbySpeed >= 3
-    ) {
-      risk =
-        "CRITICAL";
-    }
-
-    // If the vehicle is stationary but
-    // within 5 meters, still treat it
-    // as an immediate proximity risk.
-
-    else {
-      risk =
-        "EARLY";
-    }
+    risk =
+      "EARLY";
   }
 
-  // Braking inside the warning radius
-  // increases the danger level.
-
+  // Braking vehicle near the user.
   if (
     nearbyBraking &&
     distance <=
       WARNING_RADIUS_METERS &&
-    risk ===
-      "EARLY"
+    risk === "EARLY"
   ) {
     risk =
       "MEDIUM";
@@ -964,9 +733,7 @@ function calculateCollisionRisk(
 
     distance:
       Number(
-        distance.toFixed(
-          1
-        )
+        distance.toFixed(1)
       ),
 
     ownSpeed,
@@ -992,9 +759,7 @@ function calculateCollisionRisk(
 function riskPriority(
   risk
 ) {
-  switch (
-    risk
-  ) {
+  switch (risk) {
     case "CRITICAL":
       return 5;
 
@@ -1069,8 +834,7 @@ function findPrimaryThreat(
         primaryThreat.risk
       );
 
-    // Higher risk wins.
-
+    // Higher risk always wins.
     if (
       candidatePriority >
       existingPriority
@@ -1081,9 +845,8 @@ function findPrimaryThreat(
       continue;
     }
 
-    // If risk is equal,
-    // choose the nearest vehicle.
-
+    // If the risk level is equal,
+    // select the nearest vehicle.
     if (
       candidatePriority ===
         existingPriority &&
@@ -1111,20 +874,17 @@ function createWarningMessage(
   const distance =
     numberValue(
       vehicle.distance
-    ).toFixed(
-      1
-    );
+    ).toFixed(1);
 
   const vehicleName =
     vehicle.name ||
     vehicle.vehicleId;
 
   if (
-    risk ===
-    "CRITICAL"
+    risk === "CRITICAL"
   ) {
     return (
-      "Critical proximity warning. " +
+      "Critical collision risk detected. " +
       vehicleName +
       " is " +
       distance +
@@ -1133,8 +893,7 @@ function createWarningMessage(
   }
 
   if (
-    risk ===
-    "HIGH"
+    risk === "HIGH"
   ) {
     return (
       "High collision risk detected. " +
@@ -1146,8 +905,7 @@ function createWarningMessage(
   }
 
   if (
-    risk ===
-    "MEDIUM"
+    risk === "MEDIUM"
   ) {
     return (
       "Collision risk detected. " +
@@ -1157,11 +915,10 @@ function createWarningMessage(
   }
 
   if (
-    risk ===
-    "EARLY"
+    risk === "EARLY"
   ) {
     return (
-      "Vehicle inside 5 meter warning radius: " +
+      "Vehicle inside warning radius: " +
       vehicleName +
       " is " +
       distance +
@@ -1173,6 +930,7 @@ function createWarningMessage(
     "No immediate collision risk"
   );
 }
+
 // =====================================================
 // LIVE MAP DATA
 // =====================================================
@@ -1180,8 +938,7 @@ function createWarningMessage(
 function buildLiveMapData(
   receiverVehicle = null
 ) {
-  const mapVehicles =
-    [];
+  const mapVehicles = [];
 
   for (
     const vehicle
@@ -1189,7 +946,6 @@ function buildLiveMapData(
   ) {
     // Do not show stale / offline real
     // vehicles on the active live map.
-
     if (
       !isVehicleAvailableForDetection(
         vehicle
@@ -1257,7 +1013,6 @@ function buildLiveMapData(
 
   return mapVehicles;
 }
-
 // =====================================================
 // SEND VEHICLE DATA
 // =====================================================
@@ -1274,7 +1029,6 @@ function broadcastVehicleData() {
   ) {
     // Only send private vehicle intelligence
     // to connected real vehicles.
-
     if (
       !ownVehicle.socketId
     ) {
@@ -1282,7 +1036,6 @@ function broadcastVehicleData() {
     }
 
     // Skip vehicles that are offline.
-
     if (
       !isVehicleAvailableForDetection(
         ownVehicle
@@ -1333,81 +1086,6 @@ function broadcastVehicleData() {
     );
 
     // -----------------------------------------------
-    // RE-ARM WARNING PAIRS
-    // -----------------------------------------------
-
-    // If two vehicles move outside the 5 meter
-    // warning radius, their warning pair is removed.
-    // They can trigger a new warning if they later
-    // come within 5 meters again.
-
-    for (
-      const pairKey
-      of activeWarningPairs
-    ) {
-      const pair =
-        pairKey.split(
-          "::"
-        );
-
-      // Only inspect warning pairs that belong
-      // to the current receiver vehicle.
-
-      if (
-        pair[0] !==
-          ownVehicle.vehicleId &&
-        pair[1] !==
-          ownVehicle.vehicleId
-      ) {
-        continue;
-      }
-
-      const otherVehicleId =
-        pair[0] ===
-          ownVehicle.vehicleId
-          ? pair[1]
-          : pair[0];
-
-      const otherVehicle =
-        vehicles.get(
-          otherVehicleId
-        );
-
-      // Remove the pair if the other vehicle
-      // no longer exists.
-
-      if (
-        !otherVehicle
-      ) {
-        activeWarningPairs.delete(
-          pairKey
-        );
-
-        continue;
-      }
-
-      const currentDistance =
-        calculateDistanceMeters(
-          ownVehicle.latitude,
-          ownVehicle.longitude,
-          otherVehicle.latitude,
-          otherVehicle.longitude
-        );
-
-      // Re-arm warning after vehicles separate
-      // beyond 5 meters.
-
-      if (
-        currentDistance >
-        WARNING_RADIUS_METERS
-      ) {
-        activeWarningPairs.delete(
-          pairKey
-        );
-      }
-    }
-
-    // -----------------------------------------------
     // COLLISION / WARNING EVENT
     // -----------------------------------------------
 
@@ -1417,8 +1095,7 @@ function broadcastVehicleData() {
         nearbyVehicles
       );
 
-    // No vehicle inside detection radius.
-
+    // No nearby threat.
     if (
       !primaryThreat
     ) {
@@ -1464,61 +1141,24 @@ function broadcastVehicleData() {
       continue;
     }
 
-    // Create a unique pair key.
-
-    const pairKey =
-      warningPairKey(
-        ownVehicle.vehicleId,
-        primaryThreat.vehicleId
-      );
-
-    const insideWarningRadius =
-      primaryThreat.withinWarningRadius ===
-      true;
-
-    const warningAlreadyTriggered =
-      activeWarningPairs.has(
-        pairKey
-      );
-
-    // A warning can trigger only when:
-    //
-    // 1. Vehicle is within 5 meters.
-    // 2. This vehicle pair has not already
-    //    received a warning during the current
-    //    close encounter.
-
-    const shouldTriggerWarning =
-      insideWarningRadius &&
-      !warningAlreadyTriggered;
-
-    // Store the pair immediately when the
-    // first warning is triggered.
-
-    if (
-      shouldTriggerWarning
-    ) {
-      activeWarningPairs.add(
-        pairKey
-      );
-    }
+    const risk =
+      primaryThreat.risk;
 
     io.to(
       ownVehicle.socketId
     ).emit(
       "collisionWarning",
       {
-        // True only ONCE while this pair remains
-        // inside the 5 meter warning zone.
-
+        // Strong warning only for
+        // HIGH and CRITICAL situations.
         warning:
-          shouldTriggerWarning,
+          risk === "CRITICAL" ||
+          risk === "HIGH",
 
         level:
-          primaryThreat.risk,
+          risk,
 
-        risk:
-          primaryThreat.risk,
+        risk,
 
         vehicle:
           primaryThreat,
@@ -1544,7 +1184,8 @@ function broadcastVehicleData() {
           true,
 
         withinWarningRadius:
-          insideWarningRadius,
+          primaryThreat.withinWarningRadius ===
+          true,
 
         warningRadius:
           WARNING_RADIUS_METERS,
@@ -1552,20 +1193,10 @@ function broadcastVehicleData() {
         detectionRadius:
           DETECTION_RADIUS_METERS,
 
-        // Lets the Flutter app know whether
-        // this pair was already warned.
-
-        warningTriggeredOnce:
-          warningAlreadyTriggered,
-
         message:
-          shouldTriggerWarning
-            ? createWarningMessage(
-                primaryThreat
-              )
-            : insideWarningRadius
-            ? "Vehicle remains inside warning radius."
-            : "Vehicle detected. No warning triggered.",
+          createWarningMessage(
+            primaryThreat
+          ),
 
         trafficDensity,
 
@@ -1592,7 +1223,6 @@ function broadcastPositions() {
   ) {
     // Only send positions to connected
     // real vehicles.
-
     if (
       !receiver.socketId
     ) {
@@ -1613,7 +1243,6 @@ function broadcastPositions() {
     ) {
       // Don't send the receiver's own position
       // as another vehicle.
-
       if (
         vehicle.vehicleId ===
         receiver.vehicleId
@@ -1648,9 +1277,7 @@ function broadcastPositions() {
 
           distance:
             Number(
-              distance.toFixed(
-                1
-              )
+              distance.toFixed(1)
             ),
 
           withinDetectionRadius:
@@ -1691,17 +1318,8 @@ function broadcastLiveMapData() {
   ) {
     // Live map data is sent only to
     // connected real devices.
-
     if (
       !receiver.socketId
-    ) {
-      continue;
-    }
-
-    if (
-      !isVehicleAvailableForDetection(
-        receiver
-      )
     ) {
       continue;
     }
@@ -1752,15 +1370,12 @@ function broadcastLiveMapData() {
 
 function updateAllClients() {
   // Nearby vehicle intelligence.
-
   broadcastVehicleData();
 
   // Individual real-time vehicle updates.
-
   broadcastPositions();
 
   // Complete live map vehicle data.
-
   broadcastLiveMapData();
 }
 
@@ -1776,18 +1391,9 @@ function removeVehicle(
       vehicleId
     );
 
-  if (
-    !vehicle
-  ) {
+  if (!vehicle) {
     return false;
   }
-
-  // Clear one-time warning history for
-  // this vehicle before removing it.
-
-  clearWarningPairsForVehicle(
-    vehicleId
-  );
 
   vehicles.delete(
     vehicleId
@@ -1805,7 +1411,6 @@ function removeVehicle(
 
   // Refresh nearby vehicles and map
   // immediately after removal.
-
   updateAllClients();
 
   return true;
@@ -1840,6 +1445,8 @@ function stopSingleSimulation() {
   simulationActive =
     trafficSimulationTimer !==
     null;
+
+  updateAllClients();
 }
 
 // =====================================================
@@ -1867,12 +1474,13 @@ function stopTrafficSimulation() {
     );
   }
 
-  trafficSimulationIds =
-    [];
+  trafficSimulationIds = [];
 
   simulationActive =
     singleSimulationTimer !==
     null;
+
+  updateAllClients();
 }
 
 // =====================================================
@@ -1902,12 +1510,14 @@ function startSingleSimulation() {
       vehicles.values()
     ).filter(
       (vehicle) =>
-        !vehicle.simulated
+        !vehicle.simulated &&
+        isVehicleAvailableForDetection(
+          vehicle
+        )
     );
 
   if (
-    realVehicles.length ===
-    0
+    realVehicles.length === 0
   ) {
     throw new Error(
       "Connect the Flutter vehicle before starting simulation."
@@ -1922,6 +1532,9 @@ function startSingleSimulation() {
 
   singleSimulationVehicleId =
     simulatedVehicleId;
+
+  const now =
+    Date.now();
 
   const simulatedVehicle = {
     vehicleId:
@@ -1955,14 +1568,15 @@ function startSingleSimulation() {
     braking:
       false,
 
+    // Simulated GPS metadata.
     gpsAccuracy:
       3,
 
     gpsTimestamp:
-      Date.now(),
+      now,
 
     lastUpdate:
-      Date.now(),
+      now,
 
     simulated:
       true,
@@ -1976,8 +1590,7 @@ function startSingleSimulation() {
     simulatedVehicle
   );
 
-  let step =
-    0;
+  let step = 0;
 
   singleSimulationTimer =
     setInterval(
@@ -2003,9 +1616,8 @@ function startSingleSimulation() {
 
         step++;
 
-        // Move the simulated vehicle
-        // gradually toward the real vehicle.
-
+        // Move simulated vehicle
+        // toward the real vehicle.
         vehicle.latitude =
           vehicle.latitude -
           0.000006;
@@ -2039,15 +1651,18 @@ function startSingleSimulation() {
             50;
 
           vehicle.braking =
-            step % 8 ===
-            0;
+            step % 8 === 0;
         }
 
+        // Update simulated GPS metadata.
         vehicle.gpsTimestamp =
           Date.now();
 
         vehicle.lastUpdate =
           Date.now();
+
+        vehicle.status =
+          "ACTIVE";
 
         vehicles.set(
           simulatedVehicleId,
@@ -2073,6 +1688,12 @@ function startSingleSimulation() {
 
     vehicleId:
       simulatedVehicleId,
+
+    vehicleName:
+      "Simulated Bike",
+
+    status:
+      "ACTIVE",
   };
 }
 
@@ -2086,32 +1707,28 @@ function createTrafficVehicle(
   total
 ) {
   const angle =
-    (
-      index /
-      total
-    ) *
+    (index / total) *
     Math.PI *
     2;
 
   const radius =
     0.00008 +
     Math.random() *
-      0.00035;
+    0.00035;
 
   const latitudeOffset =
-    Math.cos(
-      angle
-    ) *
+    Math.cos(angle) *
     radius;
 
   const longitudeOffset =
-    Math.sin(
-      angle
-    ) *
+    Math.sin(angle) *
     radius;
 
   const vehicleId =
     `SIM_TRAFFIC_${index + 1}`;
+
+  const now =
+    Date.now();
 
   return {
     vehicleId,
@@ -2139,7 +1756,7 @@ function createTrafficVehicle(
     speed:
       8 +
       Math.random() *
-        30,
+      30,
 
     direction:
       Math.random() *
@@ -2149,13 +1766,13 @@ function createTrafficVehicle(
       false,
 
     gpsAccuracy:
-      5,
+      3,
 
     gpsTimestamp:
-      Date.now(),
+      now,
 
     lastUpdate:
-      Date.now(),
+      now,
 
     simulated:
       true,
@@ -2179,12 +1796,14 @@ function startTrafficSimulation(
       vehicles.values()
     ).filter(
       (vehicle) =>
-        !vehicle.simulated
+        !vehicle.simulated &&
+        isVehicleAvailableForDetection(
+          vehicle
+        )
     );
 
   if (
-    realVehicles.length ===
-    0
+    realVehicles.length === 0
   ) {
     throw new Error(
       "Connect the Flutter vehicle before starting traffic simulation."
@@ -2213,19 +1832,13 @@ function startTrafficSimulation(
       1,
       Math.min(
         20,
-        Math.round(
-          count
-        )
+        Math.round(count)
       )
     );
 
   for (
-    let index =
-      0;
-
-    index <
-    count;
-
+    let index = 0;
+    index < count;
     index++
   ) {
     const vehicle =
@@ -2257,9 +1870,7 @@ function startTrafficSimulation(
               vehicleId
             );
 
-          if (
-            !vehicle
-          ) {
+          if (!vehicle) {
             continue;
           }
 
@@ -2313,16 +1924,21 @@ function startTrafficSimulation(
                       Math.random() -
                       0.5
                     ) *
-                      4
+                    4
                 )
               );
           }
 
+          // Keep simulated vehicle
+          // GPS data fresh.
           vehicle.gpsTimestamp =
             Date.now();
 
           vehicle.lastUpdate =
             Date.now();
+
+          vehicle.status =
+            "ACTIVE";
 
           vehicles.set(
             vehicleId,
@@ -2348,60 +1964,60 @@ function startTrafficSimulation(
       `Traffic simulation started with ${count} vehicles.`,
 
     count,
+
+    status:
+      "ACTIVE",
   };
 }
 // =====================================================
-// SERVER STATUS API
+// STATUS API
 // =====================================================
 
 app.get(
-  "/status",
-  (
-    _request,
-    response
-  ) => {
-    const vehicleList =
+  "/api/status",
+  requireHttpAuth,
+  (_request, response) => {
+    const allVehicles =
       Array.from(
         vehicles.values()
       );
 
-    const activeVehicles =
-      vehicleList.filter(
-        (
-          vehicle
-        ) =>
-          isVehicleAvailableForDetection(
-            vehicle
-          )
+    const connectedVehicles =
+      allVehicles.filter(
+        (vehicle) =>
+          !vehicle.simulated &&
+          vehicle.socketId &&
+          !isVehicleStale(vehicle)
       );
 
     const simulatedVehicles =
-      vehicleList.filter(
-        (
-          vehicle
-        ) =>
+      allVehicles.filter(
+        (vehicle) =>
           vehicle.simulated ===
           true
       );
 
     response.json({
-      success:
-        true,
-
       project:
         "SMART V2V COMMUNICATION",
 
       status:
-        "RUNNING",
+        "Backend Running",
 
-      totalVehicles:
-        vehicleList.length,
-
-      activeVehicles:
-        activeVehicles.length,
+      connectedVehicles:
+        connectedVehicles.length,
 
       simulatedVehicles:
         simulatedVehicles.length,
+
+      totalVehicles:
+        allVehicles.length,
+
+      vehicleIds:
+        allVehicles.map(
+          (vehicle) =>
+            vehicle.vehicleId
+        ),
 
       simulationActive,
 
@@ -2411,6 +2027,9 @@ app.get(
       warningRadius:
         WARNING_RADIUS_METERS,
 
+      vehicleStaleAfter:
+        VEHICLE_STALE_AFTER_MS,
+
       timestamp:
         Date.now(),
     });
@@ -2418,104 +2037,39 @@ app.get(
 );
 
 // =====================================================
-// GET ALL VEHICLES
+// LIVE MAP API
+// =====================================================
+//
+// Returns the current live GPS information
+// for all active vehicles.
+//
+// This API can also be used by a web dashboard
+// or for testing the backend.
+//
+// Socket.IO "liveMapData" should be used by
+// Flutter for continuous real-time updates.
 // =====================================================
 
 app.get(
-  "/vehicles",
+  "/api/live-map",
   requireHttpAuth,
-  (
-    _request,
-    response
-  ) => {
-    const vehicleList =
+  (_request, response) => {
+    const allVehicles =
       Array.from(
         vehicles.values()
-      )
-        .filter(
-          (
+      );
+    const activeVehicles =
+      allVehicles.filter(
+        (vehicle) =>
+          isVehicleAvailableForDetection(
             vehicle
-          ) =>
-            isVehicleAvailableForDetection(
-              vehicle
-            )
-        )
-        .map(
-          (
-            vehicle
-          ) =>
-            buildVehicleGpsData(
-              vehicle
-            )
-        );
-
-    response.json({
-      success:
-        true,
-
-      vehicleCount:
-        vehicleList.length,
-
-      detectionRadius:
-        DETECTION_RADIUS_METERS,
-
-      warningRadius:
-        WARNING_RADIUS_METERS,
-
-      vehicles:
-        vehicleList,
-
-      timestamp:
-        Date.now(),
-    });
-  }
-);
-
-// =====================================================
-// GET LIVE MAP DATA
-// =====================================================
-
-app.get(
-  "/live-map",
-  requireHttpAuth,
-  (
-    request,
-    response
-  ) => {
-    const vehicleId =
-      String(
-        request.query
-          .vehicleId ||
-        ""
-      ).trim();
-
-    let receiverVehicle =
-      null;
-
-    if (
-      vehicleId
-    ) {
-      receiverVehicle =
-        vehicles.get(
-          vehicleId
-        ) ||
-        null;
-    }
-
-    const mapVehicles =
-      buildLiveMapData(
-        receiverVehicle
+          )
       );
 
     response.json({
       success:
         true,
 
-      currentVehicleId:
-        receiverVehicle
-          ? receiverVehicle.vehicleId
-          : null,
-
       detectionRadius:
         DETECTION_RADIUS_METERS,
 
@@ -2523,10 +2077,10 @@ app.get(
         WARNING_RADIUS_METERS,
 
       vehicleCount:
-        mapVehicles.length,
+        activeVehicles.length,
 
       vehicles:
-        mapVehicles,
+        buildLiveMapData(),
 
       timestamp:
         Date.now(),
@@ -2535,16 +2089,57 @@ app.get(
 );
 
 // =====================================================
-// START SINGLE VEHICLE SIMULATION API
+// VEHICLES API
+// =====================================================
+//
+// Returns all vehicles with complete
+// live status and GPS information.
+// =====================================================
+
+app.get(
+  "/api/vehicles",
+  requireHttpAuth,
+  (_request, response) => {
+    const vehicleData =
+      Array.from(
+        vehicles.values()
+      ).map(
+        (vehicle) =>
+          buildVehicleGpsData(
+            vehicle
+          )
+      );
+
+    response.json({
+      success:
+        true,
+
+      totalVehicles:
+        vehicleData.length,
+
+      detectionRadius:
+        DETECTION_RADIUS_METERS,
+
+      warningRadius:
+        WARNING_RADIUS_METERS,
+
+      vehicles:
+        vehicleData,
+
+      timestamp:
+        Date.now(),
+    });
+  }
+);
+
+// =====================================================
+// SIMULATE SINGLE VEHICLE
 // =====================================================
 
 app.post(
-  "/simulation/start",
+  "/api/simulate-vehicle",
   requireHttpAuth,
-  (
-    _request,
-    response
-  ) => {
+  (_request, response) => {
     try {
       const result =
         startSingleSimulation();
@@ -2552,34 +2147,30 @@ app.post(
       response.json(
         result
       );
-    } catch (
-      error
-    ) {
-      response
-        .status(400)
-        .json({
-          success:
-            false,
+    } catch (error) {
+      response.status(400).json({
+        success:
+          false,
 
-          message:
-            error.message,
-        });
+        message:
+          error.message ||
+          "Unable to start vehicle simulation.",
+      });
     }
   }
 );
 
 // =====================================================
-// STOP SINGLE VEHICLE SIMULATION API
+// STOP SINGLE SIMULATION
 // =====================================================
 
-app.post(
-  "/simulation/stop",
+app.delete(
+  "/api/simulate-vehicle",
   requireHttpAuth,
-  (
-    _request,
-    response
-  ) => {
+  (_request, response) => {
     stopSingleSimulation();
+
+    updateAllClients();
 
     response.json({
       success:
@@ -2587,25 +2178,25 @@ app.post(
 
       message:
         "Nearby vehicle simulation stopped.",
+
+      timestamp:
+        Date.now(),
     });
   }
 );
 
 // =====================================================
-// START TRAFFIC SIMULATION API
+// START TRAFFIC SIMULATION
 // =====================================================
 
 app.post(
-  "/traffic/start",
+  "/api/simulate-traffic",
   requireHttpAuth,
-  (
-    request,
-    response
-  ) => {
+  (request, response) => {
     try {
       const count =
-        request.body
-          ?.count;
+        request.body?.count ??
+        5;
 
       const result =
         startTrafficSimulation(
@@ -2615,34 +2206,30 @@ app.post(
       response.json(
         result
       );
-    } catch (
-      error
-    ) {
-      response
-        .status(400)
-        .json({
-          success:
-            false,
+    } catch (error) {
+      response.status(400).json({
+        success:
+          false,
 
-          message:
-            error.message,
-        });
+        message:
+          error.message ||
+          "Unable to start traffic simulation.",
+      });
     }
   }
 );
 
 // =====================================================
-// STOP TRAFFIC SIMULATION API
+// STOP TRAFFIC SIMULATION
 // =====================================================
 
-app.post(
-  "/traffic/stop",
+app.delete(
+  "/api/simulate-traffic",
   requireHttpAuth,
-  (
-    _request,
-    response
-  ) => {
+  (_request, response) => {
     stopTrafficSimulation();
+
+    updateAllClients();
 
     response.json({
       success:
@@ -2650,21 +2237,21 @@ app.post(
 
       message:
         "Traffic simulation stopped.",
+
+      timestamp:
+        Date.now(),
     });
   }
 );
 
 // =====================================================
-// STOP ALL SIMULATIONS API
+// STOP ALL SIMULATIONS
 // =====================================================
 
-app.post(
-  "/simulation/stop-all",
+app.delete(
+  "/api/stop-all-simulations",
   requireHttpAuth,
-  (
-    _request,
-    response
-  ) => {
+  (_request, response) => {
     stopAllSimulations();
 
     response.json({
@@ -2673,70 +2260,32 @@ app.post(
 
       message:
         "All simulations stopped.",
+
+      timestamp:
+        Date.now(),
     });
   }
 );
-
 // =====================================================
-// DELETE VEHICLE API
+// SOCKET.IO ERROR LOGGING
 // =====================================================
 
-app.delete(
-  "/vehicles/:vehicleId",
-  requireHttpAuth,
-  (
-    request,
-    response
-  ) => {
-    const vehicleId =
-      String(
-        request.params
-          .vehicleId ||
-        ""
-      ).trim();
+io.engine.on(
+  "connection_error",
+  (error) => {
+    console.error(
+      "SOCKET.IO CONNECTION ERROR:",
+      {
+        code:
+          error.code,
 
-    if (
-      !vehicleId
-    ) {
-      return response
-        .status(400)
-        .json({
-          success:
-            false,
+        message:
+          error.message,
 
-          message:
-            "Vehicle ID is required.",
-        });
-    }
-
-    const removed =
-      removeVehicle(
-        vehicleId
-      );
-
-    if (
-      !removed
-    ) {
-      return response
-        .status(404)
-        .json({
-          success:
-            false,
-
-          message:
-            "Vehicle not found.",
-        });
-    }
-
-    response.json({
-      success:
-        true,
-
-      message:
-        "Vehicle removed successfully.",
-
-      vehicleId,
-    });
+        context:
+          error.context,
+      }
+    );
   }
 );
 
@@ -2746,161 +2295,205 @@ app.delete(
 
 io.on(
   "connection",
-  (
-    socket
-  ) => {
+  (socket) => {
     console.log(
-      "VEHICLE SOCKET CONNECTED:",
+      "🔌 V2V CLIENT CONNECTED:",
       socket.id
     );
 
-    // -----------------------------------------------
-    // VEHICLE REGISTER
-    // -----------------------------------------------
+    // -------------------------------------------------
+    // REGISTER VEHICLE
+    // -------------------------------------------------
 
     socket.on(
       "registerVehicle",
-      (
-        rawData = {},
-        acknowledgement
-      ) => {
-        try {
-          const vehicleId =
-            String(
-              rawData.vehicleId ||
-              rawData.id ||
-              ""
-            ).trim();
+      (data) => {
+        const vehicleId =
+          data?.vehicleId
+            ?.toString()
+            .trim();
 
-          const latitude =
-            numberValue(
-              rawData.latitude,
-              NaN
-            );
+        if (!vehicleId) {
+          socket.emit(
+            "registrationError",
+            {
+              message:
+                "Missing vehicleId",
+            }
+          );
 
-          const longitude =
-            numberValue(
-              rawData.longitude,
-              NaN
-            );
+          return;
+        }
 
-          if (
-            !vehicleId
-          ) {
-            throw new Error(
-              "Vehicle ID is required."
-            );
-          }
+        const latitude =
+          numberValue(
+            data.latitude,
+            NaN
+          );
 
-          if (
-            !isValidCoordinate(
-              latitude,
-              longitude
-            )
-          ) {
-            throw new Error(
-              "Valid latitude and longitude are required."
-            );
-          }
+        const longitude =
+          numberValue(
+            data.longitude,
+            NaN
+          );
 
-          // If this ID was previously connected
-          // on another socket, clear the old
-          // warning state before updating.
+        if (
+          !isValidCoordinate(
+            latitude,
+            longitude
+          )
+        ) {
+          socket.emit(
+            "registrationError",
+            {
+              message:
+                "Invalid coordinates",
+            }
+          );
 
-          clearWarningPairsForVehicle(
+          return;
+        }
+
+        const previousVehicle =
+          vehicles.get(
             vehicleId
           );
 
-          const vehicle = {
+        // If the same vehicle reconnects,
+        // replace the old socket.
+        if (
+          previousVehicle &&
+          previousVehicle.socketId &&
+          previousVehicle.socketId !==
+            socket.id
+        ) {
+          const oldSocket =
+            io.sockets.sockets.get(
+              previousVehicle.socketId
+            );
+
+          if (
+            oldSocket &&
+            oldSocket.connected
+          ) {
+            oldSocket.emit(
+              "vehicleReplaced",
+              {
+                vehicleId,
+
+                timestamp:
+                  Date.now(),
+              }
+            );
+          }
+        }
+
+        const now =
+          Date.now();
+
+        const vehicle = {
+          vehicleId,
+
+          id:
             vehicleId,
 
-            id:
-              vehicleId,
+          // Vehicle name selected by user.
+          name:
+            data.name ||
+            data.vehicleName ||
+            vehicleId,
 
+          // Vehicle type selected by user.
+          type:
+            data.type ||
+            "vehicle",
+
+          // ACTIVE, PARKED, STOPPED,
+          // OFFLINE or EMERGENCY.
+          status:
+            normalizeVehicleStatus(
+              data.status
+            ),
+
+          latitude,
+
+          longitude,
+
+          speed:
+            numberValue(
+              data.speed
+            ),
+
+          direction:
+            numberValue(
+              data.direction
+            ),
+
+          braking:
+            data.braking ===
+            true,
+
+          // GPS accuracy in meters.
+          gpsAccuracy:
+            numberValue(
+              data.gpsAccuracy,
+              0
+            ),
+
+          // GPS timestamp supplied by
+          // the Flutter device.
+          gpsTimestamp:
+            numberValue(
+              data.gpsTimestamp,
+              now
+            ),
+
+          socketId:
+            socket.id,
+
+          simulated:
+            false,
+
+          lastUpdate:
+            now,
+        };
+
+        vehicles.set(
+          vehicleId,
+          vehicle
+        );
+
+        console.log(
+          "✅ VEHICLE REGISTERED:",
+          {
+            vehicleId,
             name:
-              String(
-                rawData.name ||
-                rawData.vehicleName ||
-                vehicleId
-              ).trim(),
-
+              vehicle.name,
             type:
-              String(
-                rawData.type ||
-                rawData.vehicleType ||
-                "vehicle"
-              ).trim(),
-
+              vehicle.type,
             status:
-              normalizeVehicleStatus(
-                rawData.status
-              ),
-
-            latitude,
-
-            longitude,
-
-            speed:
-              numberValue(
-                rawData.speed
-              ),
-
-            direction:
-              numberValue(
-                rawData.direction
-              ),
-
-            braking:
-              rawData.braking ===
-              true,
-
-            gpsAccuracy:
-              numberValue(
-                rawData.gpsAccuracy,
-                0
-              ),
-
-            gpsTimestamp:
-              numberValue(
-                rawData.gpsTimestamp,
-                Date.now()
-              ),
-
-            lastUpdate:
-              Date.now(),
-
-            simulated:
-              false,
-
+              vehicle.status,
             socketId:
               socket.id,
-          };
+          }
+        );
 
-          vehicles.set(
-            vehicleId,
-            vehicle
-          );
-
-          socket.data.vehicleId =
-            vehicleId;
-
-          console.log(
-            "VEHICLE REGISTERED:",
-            vehicleId,
-            vehicle.name,
-            vehicle.latitude,
-            vehicle.longitude
-          );
-
-          const responseData = {
+        socket.emit(
+          "registrationSuccess",
+          {
             success:
               true,
 
-            message:
-              "Vehicle registered successfully.",
+            vehicleId,
 
-            vehicle:
-              buildVehicleGpsData(
+            name:
+              vehicle.name,
+
+            type:
+              vehicle.type,
+
+            status:
+              getVehicleStatus(
                 vehicle
               ),
 
@@ -2911,231 +2504,298 @@ io.on(
               WARNING_RADIUS_METERS,
 
             timestamp:
-              Date.now(),
-          };
-
-          socket.emit(
-            "vehicleRegistered",
-            responseData
-          );
-
-          if (
-            typeof acknowledgement ===
-            "function"
-          ) {
-            acknowledgement(
-              responseData
-            );
+              now,
           }
+        );
 
-          updateAllClients();
-        } catch (
-          error
-        ) {
-          const errorData = {
-            success:
-              false,
-
-            message:
-              error.message,
-          };
-
-          socket.emit(
-            "vehicleRegistrationError",
-            errorData
-          );
-
-          if (
-            typeof acknowledgement ===
-            "function"
-          ) {
-            acknowledgement(
-              errorData
-            );
-          }
-        }
+        // Immediately update all devices.
+        updateAllClients();
       }
     );
-        // -----------------------------------------------
-    // LIVE GPS / VEHICLE UPDATE
-    // -----------------------------------------------
+
+    // -------------------------------------------------
+    // VEHICLE UPDATE
+    // -------------------------------------------------
 
     socket.on(
-      "updateVehicle",
-      (
-        rawData = {},
-        acknowledgement
-      ) => {
-        try {
-          const vehicleId =
-            String(
-              rawData.vehicleId ||
-              rawData.id ||
-              socket.data.vehicleId ||
-              ""
-            ).trim();
+      "vehicleUpdate",
+      (data) => {
+        const vehicleId =
+          data?.vehicleId
+            ?.toString()
+            .trim();
 
-          if (
-            !vehicleId
-          ) {
-            throw new Error(
-              "Vehicle is not registered."
-            );
-          }
+        if (!vehicleId) {
+          return;
+        }
 
-          const existingVehicle =
-            vehicles.get(
-              vehicleId
-            );
-
-          if (
-            !existingVehicle
-          ) {
-            throw new Error(
-              "Vehicle not found. Register first."
-            );
-          }
-
-          const latitude =
-            rawData.latitude !==
-            undefined
-              ? numberValue(
-                  rawData.latitude,
-                  NaN
-                )
-              : existingVehicle.latitude;
-
-          const longitude =
-            rawData.longitude !==
-            undefined
-              ? numberValue(
-                  rawData.longitude,
-                  NaN
-                )
-              : existingVehicle.longitude;
-
-          if (
-            !isValidCoordinate(
-              latitude,
-              longitude
-            )
-          ) {
-            throw new Error(
-              "Valid latitude and longitude are required."
-            );
-          }
-
-          const updatedVehicle = {
-            ...existingVehicle,
-
-            socketId:
-              socket.id,
-
-            latitude,
-
-            longitude,
-
-            speed:
-              rawData.speed !==
-              undefined
-                ? numberValue(
-                    rawData.speed
-                  )
-                : existingVehicle.speed,
-
-            direction:
-              rawData.direction !==
-              undefined
-                ? numberValue(
-                    rawData.direction
-                  )
-                : existingVehicle.direction,
-
-            braking:
-              rawData.braking !==
-              undefined
-                ? rawData.braking ===
-                  true
-                : existingVehicle.braking,
-
-            gpsAccuracy:
-              rawData.gpsAccuracy !==
-              undefined
-                ? numberValue(
-                    rawData.gpsAccuracy,
-                    existingVehicle.gpsAccuracy
-                  )
-                : existingVehicle.gpsAccuracy,
-
-            gpsTimestamp:
-              rawData.gpsTimestamp !==
-              undefined
-                ? numberValue(
-                    rawData.gpsTimestamp,
-                    Date.now()
-                  )
-                : Date.now(),
-
-            status:
-              rawData.status !==
-              undefined
-                ? normalizeVehicleStatus(
-                    rawData.status
-                  )
-                : existingVehicle.status,
-
-            lastUpdate:
-              Date.now(),
-          };
-
-          // Optional vehicle name update.
-
-          if (
-            rawData.name !==
-              undefined ||
-            rawData.vehicleName !==
-              undefined
-          ) {
-            updatedVehicle.name =
-              String(
-                rawData.name ||
-                rawData.vehicleName ||
-                existingVehicle.name
-              ).trim();
-          }
-
-          // Optional vehicle type update.
-
-          if (
-            rawData.type !==
-              undefined ||
-            rawData.vehicleType !==
-              undefined
-          ) {
-            updatedVehicle.type =
-              String(
-                rawData.type ||
-                rawData.vehicleType ||
-                existingVehicle.type
-              ).trim();
-          }
-
-          vehicles.set(
-            vehicleId,
-            updatedVehicle
+        const vehicle =
+          vehicles.get(
+            vehicleId
           );
 
-          socket.data.vehicleId =
-            vehicleId;
+        if (!vehicle) {
+          return;
+        }
 
-          const responseData = {
-            success:
-              true,
+        // Prevent another socket from
+        // updating someone else's vehicle.
+        if (
+          vehicle.socketId !==
+          socket.id
+        ) {
+          console.warn(
+            "REJECTED vehicleUpdate: socket mismatch",
+            vehicleId
+          );
 
-            vehicle:
-              buildVehicleGpsData(
-                updatedVehicle
-              ),
+          return;
+        }
+
+        const latitude =
+          numberValue(
+            data.latitude,
+            vehicle.latitude
+          );
+
+        const longitude =
+          numberValue(
+            data.longitude,
+            vehicle.longitude
+          );
+
+        if (
+          !isValidCoordinate(
+            latitude,
+            longitude
+          )
+        ) {
+          return;
+        }
+
+        const now =
+          Date.now();
+
+        // ---------------------------------------------
+        // LIVE GPS UPDATE
+        // ---------------------------------------------
+
+        vehicle.latitude =
+          latitude;
+
+        vehicle.longitude =
+          longitude;
+
+        // ---------------------------------------------
+        // VEHICLE INFORMATION UPDATE
+        // ---------------------------------------------
+
+        if (
+          data.name !== undefined ||
+          data.vehicleName !== undefined
+        ) {
+          const updatedName =
+            data.name ||
+            data.vehicleName;
+
+          if (
+            typeof updatedName ===
+              "string" &&
+            updatedName.trim()
+          ) {
+            vehicle.name =
+              updatedName.trim();
+          }
+        }
+
+        if (
+          data.type !== undefined
+        ) {
+          const updatedType =
+            String(
+              data.type
+            ).trim();
+
+          if (updatedType) {
+            vehicle.type =
+              updatedType;
+          }
+        }
+
+        if (
+          data.status !== undefined
+        ) {
+          vehicle.status =
+            normalizeVehicleStatus(
+              data.status
+            );
+        }
+
+        // ---------------------------------------------
+        // SPEED / DIRECTION / BRAKING
+        // ---------------------------------------------
+
+        vehicle.speed =
+          numberValue(
+            data.speed,
+            vehicle.speed
+          );
+
+        vehicle.direction =
+          numberValue(
+            data.direction,
+            vehicle.direction
+          );
+
+        vehicle.braking =
+          data.braking ===
+          true;
+
+        // ---------------------------------------------
+        // GPS ACCURACY
+        // ---------------------------------------------
+
+        if (
+          data.gpsAccuracy !==
+          undefined
+        ) {
+          vehicle.gpsAccuracy =
+            numberValue(
+              data.gpsAccuracy,
+              vehicle.gpsAccuracy
+            );
+        }
+
+        // ---------------------------------------------
+        // GPS TIMESTAMP
+        // ---------------------------------------------
+
+        vehicle.gpsTimestamp =
+          numberValue(
+            data.gpsTimestamp,
+            now
+          );
+
+        // Backend update timestamp.
+        vehicle.lastUpdate =
+          now;
+
+        vehicles.set(
+          vehicleId,
+          vehicle
+        );
+
+        // Send the new GPS data to
+        // all connected vehicles.
+        updateAllClients();
+      }
+    );
+
+    // -------------------------------------------------
+    // VEHICLE STATUS UPDATE
+    // -------------------------------------------------
+    //
+    // Flutter can send this event when only the
+    // vehicle status changes without a full GPS update.
+    // -------------------------------------------------
+
+    socket.on(
+      "vehicleStatusUpdate",
+      (data) => {
+        const vehicleId =
+          data?.vehicleId
+            ?.toString()
+            .trim();
+
+        if (!vehicleId) {
+          return;
+        }
+
+        const vehicle =
+          vehicles.get(
+            vehicleId
+          );
+
+        if (!vehicle) {
+          return;
+        }
+
+        if (
+          vehicle.socketId !==
+          socket.id
+        ) {
+          return;
+        }
+
+        if (
+          data.status !==
+          undefined
+        ) {
+          vehicle.status =
+            normalizeVehicleStatus(
+              data.status
+            );
+        }
+
+        vehicle.lastUpdate =
+          Date.now();
+
+        vehicles.set(
+          vehicleId,
+          vehicle
+        );
+
+        updateAllClients();
+      }
+    );
+
+    // -------------------------------------------------
+    // REQUEST LIVE MAP DATA
+    // -------------------------------------------------
+    //
+    // Flutter can request an immediate map refresh.
+    // -------------------------------------------------
+
+    socket.on(
+      "requestLiveMapData",
+      () => {
+        let receiverVehicle =
+          null;
+
+        for (
+          const vehicle
+          of vehicles.values()
+        ) {
+          if (
+            vehicle.socketId ===
+            socket.id
+          ) {
+            receiverVehicle =
+              vehicle;
+
+            break;
+          }
+        }
+
+        if (!receiverVehicle) {
+          return;
+        }
+
+        const mapVehicles =
+          buildLiveMapData(
+            receiverVehicle
+          );
+
+        const nearbyVehicles =
+          buildNearbyVehicleData(
+            receiverVehicle
+          );
+
+        socket.emit(
+          "liveMapData",
+          {
+            currentVehicleId:
+              receiverVehicle.vehicleId,
 
             detectionRadius:
               DETECTION_RADIUS_METERS,
@@ -3143,441 +2803,92 @@ io.on(
             warningRadius:
               WARNING_RADIUS_METERS,
 
-            timestamp:
-              Date.now(),
-          };
+            vehicleCount:
+              mapVehicles.length,
 
-          socket.emit(
-            "vehicleUpdated",
-            responseData
-          );
+            nearbyVehicleCount:
+              nearbyVehicles.length,
 
-          if (
-            typeof acknowledgement ===
-            "function"
-          ) {
-            acknowledgement(
-              responseData
-            );
-          }
-
-          // Immediately refresh nearby vehicle,
-          // warning, and live map data.
-
-          updateAllClients();
-        } catch (
-          error
-        ) {
-          const errorData = {
-            success:
-              false,
-
-            message:
-              error.message,
-          };
-
-          socket.emit(
-            "vehicleUpdateError",
-            errorData
-          );
-
-          if (
-            typeof acknowledgement ===
-            "function"
-          ) {
-            acknowledgement(
-              errorData
-            );
-          }
-        }
-      }
-    );
-
-    // -----------------------------------------------
-    // UPDATE VEHICLE STATUS
-    // -----------------------------------------------
-
-    socket.on(
-      "updateVehicleStatus",
-      (
-        rawData = {},
-        acknowledgement
-      ) => {
-        try {
-          const vehicleId =
-            String(
-              rawData.vehicleId ||
-              rawData.id ||
-              socket.data.vehicleId ||
-              ""
-            ).trim();
-
-          if (
-            !vehicleId
-          ) {
-            throw new Error(
-              "Vehicle is not registered."
-            );
-          }
-
-          const vehicle =
-            vehicles.get(
-              vehicleId
-            );
-
-          if (
-            !vehicle
-          ) {
-            throw new Error(
-              "Vehicle not found."
-            );
-          }
-
-          vehicle.status =
-            normalizeVehicleStatus(
-              rawData.status
-            );
-
-          vehicle.lastUpdate =
-            Date.now();
-
-          vehicle.socketId =
-            socket.id;
-
-          vehicles.set(
-            vehicleId,
-            vehicle
-          );
-
-          const responseData = {
-            success:
-              true,
-
-            vehicleId,
-
-            status:
-              vehicle.status,
+            vehicles:
+              mapVehicles,
 
             timestamp:
               Date.now(),
-          };
-
-          socket.emit(
-            "vehicleStatusUpdated",
-            responseData
-          );
-
-          if (
-            typeof acknowledgement ===
-            "function"
-          ) {
-            acknowledgement(
-              responseData
-            );
           }
-
-          updateAllClients();
-        } catch (
-          error
-        ) {
-          const errorData = {
-            success:
-              false,
-
-            message:
-              error.message,
-          };
-
-          socket.emit(
-            "vehicleStatusError",
-            errorData
-          );
-
-          if (
-            typeof acknowledgement ===
-            "function"
-          ) {
-            acknowledgement(
-              errorData
-            );
-          }
-        }
-      }
-    );
-
-    // -----------------------------------------------
-    // REQUEST LIVE MAP DATA
-    // -----------------------------------------------
-
-    socket.on(
-      "requestLiveMapData",
-      (
-        _rawData = {},
-        acknowledgement
-      ) => {
-        const vehicleId =
-          socket.data.vehicleId;
-
-        const receiverVehicle =
-          vehicleId
-            ? vehicles.get(
-                vehicleId
-              )
-            : null;
-
-        const mapVehicles =
-          buildLiveMapData(
-            receiverVehicle
-          );
-
-        const responseData = {
-          currentVehicleId:
-            receiverVehicle
-              ? receiverVehicle.vehicleId
-              : null,
-
-          detectionRadius:
-            DETECTION_RADIUS_METERS,
-
-          warningRadius:
-            WARNING_RADIUS_METERS,
-
-          vehicleCount:
-            mapVehicles.length,
-
-          vehicles:
-            mapVehicles,
-
-          timestamp:
-            Date.now(),
-        };
-
-        socket.emit(
-          "liveMapData",
-          responseData
         );
-
-        if (
-          typeof acknowledgement ===
-          "function"
-        ) {
-          acknowledgement(
-            responseData
-          );
-        }
       }
     );
 
-    // -----------------------------------------------
-    // REQUEST NEARBY VEHICLES
-    // -----------------------------------------------
-
-    socket.on(
-      "requestNearbyVehicles",
-      (
-        _rawData = {},
-        acknowledgement
-      ) => {
-        const vehicleId =
-          socket.data.vehicleId;
-
-        const ownVehicle =
-          vehicleId
-            ? vehicles.get(
-                vehicleId
-              )
-            : null;
-
-        if (
-          !ownVehicle
-        ) {
-          const errorData = {
-            success:
-              false,
-
-            message:
-              "Vehicle not registered.",
-          };
-
-          socket.emit(
-            "nearbyVehicles",
-            {
-              radius:
-                DETECTION_RADIUS_METERS,
-
-              detectionRadius:
-                DETECTION_RADIUS_METERS,
-
-              warningRadius:
-                WARNING_RADIUS_METERS,
-
-              vehicleCount:
-                0,
-
-              vehicles:
-                [],
-
-              timestamp:
-                Date.now(),
-            }
-          );
-
-          if (
-            typeof acknowledgement ===
-            "function"
-          ) {
-            acknowledgement(
-              errorData
-            );
-          }
-
-          return;
-        }
-
-        const nearbyVehicles =
-          buildNearbyVehicleData(
-            ownVehicle
-          );
-
-        const trafficDensity =
-          calculateTrafficDensity(
-            nearbyVehicles
-          );
-
-        const responseData = {
-          success:
-            true,
-
-          radius:
-            DETECTION_RADIUS_METERS,
-
-          detectionRadius:
-            DETECTION_RADIUS_METERS,
-
-          warningRadius:
-            WARNING_RADIUS_METERS,
-
-          vehicleCount:
-            nearbyVehicles.length,
-
-          vehicles:
-            nearbyVehicles,
-
-          trafficDensity,
-
-          timestamp:
-            Date.now(),
-        };
-
-        socket.emit(
-          "nearbyVehicles",
-          responseData
-        );
-
-        if (
-          typeof acknowledgement ===
-          "function"
-        ) {
-          acknowledgement(
-            responseData
-          );
-        }
-      }
-    );
-
-    // -----------------------------------------------
+    // -------------------------------------------------
     // DISCONNECT
-    // -----------------------------------------------
+    // -------------------------------------------------
 
     socket.on(
       "disconnect",
-      (
-        reason
-      ) => {
-        const vehicleId =
-          socket.data.vehicleId;
-
+      () => {
         console.log(
-          "VEHICLE SOCKET DISCONNECTED:",
-          socket.id,
-          "REASON:",
-          reason
+          "⚠️ V2V CLIENT DISCONNECTED:",
+          socket.id
         );
 
-        if (
-          vehicleId
+        let removedVehicleId =
+          null;
+
+        for (
+          const [
+            vehicleId,
+            vehicle,
+          ]
+          of vehicles.entries()
         ) {
-          const vehicle =
-            vehicles.get(
-              vehicleId
-            );
-
-          // Remove the vehicle only if this socket
-          // is still the active socket for that ID.
-
           if (
-            vehicle &&
             vehicle.socketId ===
-              socket.id
+            socket.id
           ) {
-            // Clear all one-time warning pairs
-            // involving this vehicle.
-
-            clearWarningPairsForVehicle(
-              vehicleId
-            );
+            removedVehicleId =
+              vehicleId;
 
             vehicles.delete(
               vehicleId
             );
 
-            io.emit(
-              "vehicleRemoved",
-              {
-                vehicleId,
-
-                timestamp:
-                  Date.now(),
-              }
-            );
-
-            updateAllClients();
+            break;
           }
         }
+
+        if (
+          removedVehicleId
+        ) {
+          io.emit(
+            "vehicleRemoved",
+            {
+              vehicleId:
+                removedVehicleId,
+
+              timestamp:
+                Date.now(),
+            }
+          );
+        }
+
+        // Refresh nearby vehicles and
+        // the live map immediately.
+        updateAllClients();
       }
     );
   }
 );
-// =====================================================
-// PERIODIC VEHICLE CLEANUP
-// =====================================================
-
-// Check for stale vehicles periodically.
-//
-// Simulated vehicles are kept active because they
-// update themselves. Real vehicles that stop sending
-// GPS data are marked OFFLINE by getVehicleStatus().
-//
-// This periodic update refreshes all connected clients
-// so offline vehicles disappear from nearby detection
-// and live map data.
-
-setInterval(
-  () => {
-    updateAllClients();
-  },
-  3000
-);
 
 // =====================================================
-// SERVER START
+// START SERVER
 // =====================================================
 
 server.listen(
   PORT,
+  "0.0.0.0",
   () => {
     console.log(
-      "========================================"
+      "================================"
     );
 
     console.log(
@@ -3589,6 +2900,10 @@ server.listen(
     );
 
     console.log(
+      `LOCAL NETWORK: http://YOUR_PC_IP:${PORT}`
+    );
+
+    console.log(
       `DETECTION RADIUS: ${DETECTION_RADIUS_METERS} meters`
     );
 
@@ -3597,122 +2912,17 @@ server.listen(
     );
 
     console.log(
-      `AUTHENTICATION: ${
-        V2V_SHARED_SECRET
-          ? "ENABLED"
-          : "DISABLED"
-      }`
+      `VEHICLE STALE AFTER: ${VEHICLE_STALE_AFTER_MS} ms`
     );
 
     console.log(
-      "========================================"
-    );
-  }
-);
-
-// =====================================================
-// GRACEFUL SHUTDOWN
-// =====================================================
-
-function gracefulShutdown(
-  signal
-) {
-  console.log(
-    `Received ${signal}. Shutting down V2V server...`
-  );
-
-  // Stop all running simulation timers.
-
-  if (
-    singleSimulationTimer
-  ) {
-    clearInterval(
-      singleSimulationTimer
+      V2V_SHARED_SECRET
+        ? "AUTH: shared-secret enabled"
+        : "AUTH: disabled"
     );
 
-    singleSimulationTimer =
-      null;
-  }
-
-  if (
-    trafficSimulationTimer
-  ) {
-    clearInterval(
-      trafficSimulationTimer
+    console.log(
+      "================================"
     );
-
-    trafficSimulationTimer =
-      null;
   }
-
-  // Clear simulation state.
-
-  trafficSimulationIds =
-    [];
-
-  singleSimulationVehicleId =
-    null;
-
-  simulationActive =
-    false;
-
-  // Clear warning tracking.
-
-  activeWarningPairs.clear();
-
-  // Close Socket.IO first.
-
-  io.close(
-    () => {
-      console.log(
-        "Socket.IO closed."
-      );
-
-      // Then close HTTP server.
-
-      server.close(
-        () => {
-          console.log(
-            "HTTP server closed."
-          );
-
-          process.exit(
-            0
-          );
-        }
-      );
-    }
-  );
-
-  // Force exit if graceful shutdown takes
-  // too long.
-
-  setTimeout(
-    () => {
-      console.error(
-        "Forced server shutdown."
-      );
-
-      process.exit(
-        1
-      );
-    },
-    10000
-  ).unref();
-}
-
-process.on(
-  "SIGTERM",
-  () =>
-    gracefulShutdown(
-      "SIGTERM"
-    )
-);
-
-process.on(
-  "SIGINT",
-  () =>
-    gracefulShutdown(
-      "SIGINT"
-    )
 );
