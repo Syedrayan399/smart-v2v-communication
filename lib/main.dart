@@ -1428,13 +1428,20 @@ class _V2VHomePageState
     };
 
     v2vService.onLiveMapData =
-        (
-      List<dynamic> vehicles,
-    ) {
-      _handleLiveMapData(
-        vehicles,
-      );
-    };
+    (
+  Map<String, dynamic> data,
+) {
+  final List<dynamic> vehicles =
+      data['vehicles'] is List
+          ? List<dynamic>.from(
+              data['vehicles'],
+            )
+          : <dynamic>[];
+
+  _handleLiveMapData(
+    vehicles,
+  );
+};
 
     v2vService.onVehicleRemoved =
         (
