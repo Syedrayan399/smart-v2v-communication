@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:http/http.dart' as http;
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 
@@ -19,6 +20,9 @@ import 'package:socket_io_client/socket_io_client.dart' as IO;
 /// - Simulation HTTP APIs
 class V2VService {
   IO.Socket? _socket;
+
+  // Firestore stores the latest known state for this vehicle.
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   late final String _baseUrl;
 
@@ -182,6 +186,10 @@ class V2VService {
     _longitude = longitude;
     _gpsAccuracy = gpsAccuracy;
     _gpsTimestamp = gpsTimestamp;
+
+    // Save the initial/latest GPS position to Firestore without
+    // affecting the existing Socket.IO V2V connection flow.
+    _saveVehicleToFirestore();
 
     print('🔌 ========================================');
     print('🔌 CONNECTING V2V');
@@ -685,6 +693,11 @@ class V2VService {
     _gpsAccuracy = gpsAccuracy;
     _gpsTimestamp = gpsTimestamp;
 
+    // Every GPS update is also persisted to Firestore. This runs
+    // independently of Socket.IO so temporary backend disconnects do
+    // not stop the latest location from being saved.
+    _saveVehicleToFirestore();
+
     final socket = _socket;
 
     if (socket == null ||
@@ -710,6 +723,66 @@ class V2VService {
         'gpsTimestamp': gpsTimestamp,
       },
     );
+  }
+
+  // ============================================================
+  // FIRESTORE VEHICLE LOCATION
+  // ============================================================
+
+  /// Saves the latest known vehicle state to Firestore.
+  ///
+  /// Document path:
+  ///   vehicles/{vehicleId}
+  ///
+  /// set(..., merge: true) preserves any future fields that may be
+  /// added by other parts of the application.
+  Future<void> _saveVehicleToFirestore() async {
+    final vehicleId = _vehicleId;
+    final latitude = _latitude;
+    final longitude = _longitude;
+
+    if (vehicleId == null ||
+        vehicleId.trim().isEmpty ||
+        latitude == null ||
+        longitude == null) {
+      return;
+    }
+
+    final timestamp = _gpsTimestamp > 0
+        ? _gpsTimestamp
+        : DateTime.now().millisecondsSinceEpoch;
+
+    try {
+      await _firestore
+          .collection('vehicles')
+          .doc(vehicleId)
+          .set(
+        {
+          'vehicleId': vehicleId,
+          'name': _vehicleName ?? vehicleId,
+          'vehicleName': _vehicleName ?? vehicleId,
+          'type': _vehicleType ?? 'Vehicle',
+          'status': _vehicleStatus,
+          'latitude': latitude,
+          'longitude': longitude,
+          'speed': _speed,
+          'direction': _direction,
+          'braking': _braking,
+          'gpsAccuracy': _gpsAccuracy,
+          'gpsTimestamp': timestamp,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
+    } catch (error, stackTrace) {
+      // Firestore must never interrupt the working V2V functionality.
+      developer.log(
+        'Failed to save vehicle location to Firestore',
+        name: 'V2VService',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   // ============================================================

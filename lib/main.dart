@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_map/flutter_map.dart';
@@ -20,8 +22,12 @@ const String kCollisionAudioAsset =
 // APP
 // =====================================================
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
 
   runApp(
     const V2VApp(),
@@ -80,6 +86,16 @@ class _V2VHomePageState
 
   StreamSubscription<Position>?
       gpsSubscription;
+
+  // Real-time Firestore listener for the latest location of every
+  // vehicle. This powers the live map independently from the Socket.IO
+  // V2V safety stream, so the working collision/nearby-vehicle logic
+  // remains unchanged.
+  StreamSubscription<
+      QuerySnapshot<Map<String, dynamic>>>?
+      _firestoreVehicleSubscription;
+
+  bool _firestoreLiveMapActive = false;
 
   // Fast V2V synchronization. GPS hardware decides when a truly new
   // satellite fix is available, but the app checks and publishes the
@@ -352,8 +368,10 @@ class _V2VHomePageState
 
   List<dynamic> nearbyVehicles = [];
 
-  // Complete active-vehicle snapshot received from the backend for the
-  // Intelligence live map. Nearby Vehicles remains a separate, filtered list.
+  // Complete active-vehicle snapshot displayed on the Intelligence live map.
+  // Once Firestore is available, this list is kept in real time from the
+  // `vehicles` collection. Nearby Vehicles remains a separate, backend-driven
+  // safety list so collision detection is not changed.
   List<dynamic> liveMapVehicles = [];
 
   // Only vehicles within this radius are kept and displayed.
@@ -767,11 +785,9 @@ class _V2VHomePageState
       return false;
     }
 
-    // Accuracy gate: if our own GPS fix is worse than ~20 m we cannot trust
-    // a "5 m" reading. This is the main cause of false alarms indoors.
-    if (gpsAccuracyMeters > _maxAccuracyForCriticalAlert) {
-      return false;
-    }
+    // The backend/local distance check is authoritative for the 5 m trigger.
+    // Do not block the one-shot alarm just because phone GPS accuracy is
+    // temporarily poor (especially during indoor/simulation testing).
 
     // Unknown IDs are not allowed to bypass the one-shot protection.
     if (vehicleId.isEmpty || vehicleId == 'UNKNOWN') {
@@ -1308,6 +1324,7 @@ class _V2VHomePageState
     initializeCollisionAudio();
 
     _configureV2VCallbacks();
+    _startFirestoreVehicleListener();
 
     WidgetsBinding.instance
         .addPostFrameCallback(
@@ -1331,6 +1348,7 @@ class _V2VHomePageState
     _gpsPollingTimer?.cancel();
     _v2vSyncTimer?.cancel();
     gpsSubscription?.cancel();
+    _firestoreVehicleSubscription?.cancel();
 
     v2vService.disconnect();
 
@@ -1451,6 +1469,75 @@ class _V2VHomePageState
         removedVehicleId,
       );
     };
+  }
+
+  // =====================================================
+  // FIRESTORE LIVE VEHICLE MAP
+  // =====================================================
+
+  /// Listens to `vehicles` in Firestore and keeps the Intelligence live
+  /// map synchronized in real time. Firestore is used only for map data;
+  /// the existing Socket.IO V2V callbacks continue to handle nearby-vehicle
+  /// safety and collision warnings.
+  void _startFirestoreVehicleListener() {
+    _firestoreVehicleSubscription?.cancel();
+
+    _firestoreVehicleSubscription = FirebaseFirestore.instance
+        .collection('vehicles')
+        .snapshots()
+        .listen(
+      (QuerySnapshot<Map<String, dynamic>> snapshot) {
+        final List<dynamic> cleanedVehicles = <dynamic>[];
+
+        for (final QueryDocumentSnapshot<Map<String, dynamic>> document
+            in snapshot.docs) {
+          final Map<String, dynamic> vehicle =
+              Map<String, dynamic>.from(document.data());
+
+          // The document ID is the vehicle ID, but keep a field value if it
+          // already exists for compatibility with the current backend data.
+          final String id =
+              _getVehicleId(vehicle).isNotEmpty
+                  ? _getVehicleId(vehicle)
+                  : document.id;
+
+          vehicle['vehicleId'] = id;
+
+          // The current vehicle is already drawn locally.
+          if (id.isEmpty || id == vehicleId) {
+            continue;
+          }
+
+          final double? lat = _getVehicleLatitude(vehicle);
+          final double? lng = _getVehicleLongitude(vehicle);
+
+          if (lat == null || lng == null) {
+            continue;
+          }
+
+          if (!_hasValidCoordinates(lat, lng)) {
+            continue;
+          }
+
+          cleanedVehicles.add(vehicle);
+        }
+
+        if (!mounted) {
+          return;
+        }
+
+        setState(() {
+          liveMapVehicles = cleanedVehicles;
+          _firestoreLiveMapActive = true;
+        });
+      },
+      onError: (Object error) {
+        // Firestore map updates are optional and must never interrupt the
+        // existing V2V Socket.IO functionality. If Firestore is temporarily
+        // unavailable, the map can continue using backend live-map updates.
+        _firestoreLiveMapActive = false;
+      },
+    );
   }
 
   // =====================================================
@@ -2218,6 +2305,13 @@ class _V2VHomePageState
       return;
     }
 
+    // Firestore is the preferred real-time source for the live map. Keep the
+    // Socket.IO snapshot as a fallback only until the Firestore listener has
+    // successfully delivered data.
+    if (_firestoreLiveMapActive) {
+      return;
+    }
+
     setState(() {
       liveMapVehicles = cleanedVehicles;
     });
@@ -2464,6 +2558,24 @@ class _V2VHomePageState
       extractedVehicle,
     );
 
+    // The 5 m rule is distance-based. If the backend sends HIGH/EARLY because
+    // of its own speed/risk rules, promote the event to CRITICAL when the
+    // actual supplied/measured distance is within 5 metres.
+    final double incomingDistance =
+        extractedVehicle == null
+            ? _toDouble(
+                data['distance'],
+                fallback: double.infinity,
+              )
+            : _distanceFromVehicle(
+                extractedVehicle,
+              );
+
+    if (incomingDistance.isFinite &&
+        incomingDistance <= _criticalDistanceMeters) {
+      incomingStatus = 'CRITICAL';
+    }
+
     // Ignore collision events for our own vehicle.
     if (incomingVehicleId.isNotEmpty &&
         incomingVehicleId ==
@@ -2580,20 +2692,10 @@ class _V2VHomePageState
     // CRITICAL sound + vibration are allowed only once, and only at 5 m or less.
     if (incomingStatus ==
         'CRITICAL') {
-      final double criticalDistance =
-          extractedVehicle == null
-              ? _toDouble(
-                  data['distance'],
-                  fallback: double.infinity,
-                )
-              : _distanceFromVehicle(
-                  extractedVehicle,
-                );
-
       final bool shouldPlay =
           _shouldPlayCriticalAlert(
         incomingVehicleId,
-        criticalDistance,
+        incomingDistance,
       );
 
       awaitWarningAction(
@@ -2971,40 +3073,25 @@ class _V2VHomePageState
         vehicle['braking'] == true;
 
     // -----------------------------------------------------
-    // Accuracy-aware thresholds
+    // Distance-based safety thresholds
     // -----------------------------------------------------
-    // When GPS accuracy is poor we raise the distances so
-    // that noisy indoor fixes do not create false CRITICAL
-    // or HIGH states.
+    // The emergency sound rule is exact: 5 m or less is CRITICAL.
+    // GPS accuracy must not silently downgrade the alert and prevent the
+    // one-time warning from playing.
     // -----------------------------------------------------
-    final double accuracyPenalty =
-        gpsAccuracyMeters > 25
-            ? gpsAccuracyMeters * 0.6
-            : 0.0;
-
-    final double criticalLimit =
-        _criticalDistanceMeters + accuracyPenalty;
-    final double highLimit = 20.0 + accuracyPenalty;
-    final double mediumLimit = 50.0 + accuracyPenalty;
-    final double earlyLimit = 100.0 + accuracyPenalty;
-
-    if (distance <= criticalLimit) {
-      // Only allow CRITICAL when accuracy is good enough.
-      if (gpsAccuracyMeters <= _maxAccuracyForCriticalAlert) {
-        return 'CRITICAL';
-      }
-      return 'HIGH'; // degrade to HIGH when accuracy is bad
+    if (distance <= _criticalDistanceMeters) {
+      return 'CRITICAL';
     }
 
-    if (distance <= highLimit) {
+    if (distance <= 20.0) {
       return 'HIGH';
     }
 
-    if (distance <= mediumLimit) {
+    if (distance <= 50.0) {
       return 'MEDIUM';
     }
 
-    if (distance <= earlyLimit) {
+    if (distance <= 100.0) {
       return 'EARLY';
     }
 
@@ -3012,13 +3099,13 @@ class _V2VHomePageState
     // warning even when it is slightly farther away.
     if (speed >= 40 &&
         otherSpeed >= 40 &&
-        distance <= 150 + accuracyPenalty) {
+        distance <= 150) {
       return 'EARLY';
     }
 
     if (braking &&
         otherBraking &&
-        distance <= 80 + accuracyPenalty) {
+        distance <= 80) {
       return 'MEDIUM';
     }
 
