@@ -1,6 +1,7 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+const admin = require("firebase-admin/app");
 
 const app = express();
 const server = http.createServer(app);
@@ -11,35 +12,56 @@ const server = http.createServer(app);
 
 const PORT = Number(process.env.PORT || 3000);
 
-// IMPORTANT:
-// This is NOT your ngrok authtoken.
+// Firebase Admin credentials MUST be supplied through
+// the environment.
 //
-// Set this only if you want V2V authentication.
-//
-// Windows PowerShell example:
-//
-// $env:V2V_SHARED_SECRET="my_secret"
-// node backend/server.js
-//
-// Leave empty to disable authentication for local testing.
-const V2V_SHARED_SECRET =
-  (process.env.V2V_SHARED_SECRET || "").trim();
+// NEVER commit a Firebase service-account JSON file
+// to GitHub.
+const FIREBASE_SERVICE_ACCOUNT_JSON =
+  (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+
+if (!FIREBASE_SERVICE_ACCOUNT_JSON) {
+  throw new Error(
+    "FIREBASE_SERVICE_ACCOUNT_JSON is not configured. " +
+      "Set the Firebase Admin service-account JSON in the environment."
+  );
+}
+
+let firebaseServiceAccount;
+
+try {
+  firebaseServiceAccount = JSON.parse(
+    FIREBASE_SERVICE_ACCOUNT_JSON
+  );
+} catch (error) {
+  throw new Error(
+    "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: " +
+      error.message
+  );
+}
+
+const { initializeApp, cert } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+
+initializeApp({
+  credential: cert(firebaseServiceAccount),
+});
+
+const firebaseAuth = getAuth();
+
 
 const DETECTION_RADIUS_METERS = 200;
 
-// Step 12: stale vehicle cleanup. Socket liveness is separate from GPS
-// freshness: a connected phone may stop sending GPS updates temporarily,
-// while a dead connection should eventually be removed from server state.
-const GPS_STALE_AFTER_MS = 4000;
-const VEHICLE_EXPIRE_AFTER_MS = 8000;
-const STALE_CLEANUP_INTERVAL_MS = 1000;
+// =====================================================
+// CORS
+// =====================================================
 
 const appCorsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods":
     "GET,POST,DELETE,OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, Authorization, x-v2v-token",
+    "Content-Type, Authorization",
 };
 
 app.use(express.json({ limit: "1mb" }));
@@ -61,15 +83,22 @@ app.use((request, response, next) => {
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    methods: [
+      "GET",
+      "POST",
+      "DELETE",
+      "OPTIONS",
+    ],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
-      "x-v2v-token",
     ],
   },
 
-  transports: ["polling", "websocket"],
+  transports: [
+    "polling",
+    "websocket",
+  ],
 
   allowUpgrades: true,
 
@@ -85,16 +114,6 @@ const io = new Server(server, {
 // =====================================================
 
 const vehicles = new Map();
-
-// Short server-side trajectory history. This is deliberately bounded so the
-// backend can validate motion without becoming a long-term telemetry store.
-const trajectoryHistory = new Map();
-const threatPersistence = new Map();
-
-const TRAJECTORY_MAX_SAMPLES = 8;
-const TRAJECTORY_MAX_AGE_MS = 10000;
-const GPS_FRESHNESS_MS = 4000;
-const MAX_RELIABLE_GPS_ACCURACY = 20;
 
 let singleSimulationTimer = null;
 let trafficSimulationTimer = null;
@@ -118,110 +137,103 @@ app.get("/", (_request, response) => {
 });
 
 // =====================================================
-// HTTP AUTH
+// FIREBASE HTTP AUTHENTICATION
 // =====================================================
 
-function getHttpToken(request) {
-  const customToken =
-    request.headers["x-v2v-token"];
-
-  if (
-    typeof customToken === "string" &&
-    customToken.trim().isNotEmpty !== true
-  ) {
-    // Kept below through normal logic.
-  }
-
-  if (
-    typeof customToken === "string" &&
-    customToken.trim()
-  ) {
-    return customToken.trim();
-  }
-
+function getBearerToken(request) {
   const authorization =
     request.headers.authorization;
 
   if (
-    typeof authorization === "string" &&
-    authorization.startsWith("Bearer ")
+    typeof authorization !== "string" ||
+    !authorization.startsWith("Bearer ")
   ) {
-    return authorization
-      .substring("Bearer ".length)
-      .trim();
+    return "";
   }
 
-  return "";
+  return authorization
+    .substring("Bearer ".length)
+    .trim();
 }
 
-function requireHttpAuth(
+async function requireHttpAuth(
   request,
   response,
   next
 ) {
-  // Authentication is optional.
+  try {
+    const token =
+      getBearerToken(request);
 
-  if (!V2V_SHARED_SECRET) {
-    return next();
-  }
+    if (!token) {
+      return response.status(401).json({
+        success: false,
+        message:
+          "Missing Firebase ID token",
+      });
+    }
 
-  const token =
-    getHttpToken(request);
+    request.user =
+      await firebaseAuth.verifyIdToken(
+        token
+      );
 
-  if (
-    token !==
-    V2V_SHARED_SECRET
-  ) {
+    next();
+  } catch (error) {
+    console.warn(
+      "HTTP AUTH REJECTED:",
+      error.code ||
+        error.message
+    );
+
     return response.status(401).json({
       success: false,
       message: "Unauthorized",
     });
   }
-
-  next();
 }
 
 // =====================================================
-// SOCKET AUTH
+// SOCKET FIREBASE AUTHENTICATION
 // =====================================================
 
-io.use((socket, next) => {
-  // Authentication is optional.
+io.use(async (socket, next) => {
+  try {
+    const token =
+      socket.handshake.auth?.token;
 
-  if (!V2V_SHARED_SECRET) {
-    return next();
-  }
+    if (
+      typeof token !== "string" ||
+      !token.trim()
+    ) {
+      return next(
+        new Error("unauthorized")
+      );
+    }
 
-  const queryToken =
-    socket.handshake.query?.token;
+    const decodedToken =
+      await firebaseAuth.verifyIdToken(
+        token.trim()
+      );
 
-  const authToken =
-    socket.handshake.auth?.token;
+    socket.user =
+      decodedToken;
 
-  const token =
-    typeof authToken === "string" &&
-    authToken.trim()
-      ? authToken.trim()
-      : typeof queryToken === "string"
-      ? queryToken.trim()
-      : "";
+    socket.uid =
+      decodedToken.uid;
 
-  if (
-    token !==
-    V2V_SHARED_SECRET
-  ) {
+    next();
+  } catch (error) {
     console.warn(
       "SOCKET AUTH REJECTED:",
-      socket.id,
-      socket.handshake.address
+      error.code ||
+        error.message
     );
 
-    return next(
+    next(
       new Error("unauthorized")
     );
   }
-
-  next();
 });
 
 // =====================================================
@@ -276,10 +288,14 @@ function calculateDistanceMeters(
       (value * Math.PI) / 180;
 
   const latitudeDifference =
-    toRadians(lat2 - lat1);
+    toRadians(
+      lat2 - lat1
+    );
 
   const longitudeDifference =
-    toRadians(lon2 - lon1);
+    toRadians(
+      lon2 - lon1
+    );
 
   const a =
     Math.sin(
@@ -367,486 +383,6 @@ function calculateTrafficDensity(
 }
 
 // =====================================================
-// TRAJECTORY / COLLISION HELPERS
-// =====================================================
-
-function normalizeAngleDifference(first, second) {
-  let difference = (first - second) % 360;
-  if (difference > 180) difference -= 360;
-  if (difference < -180) difference += 360;
-  return Math.abs(difference);
-}
-
-function normalizeHeading(value) {
-  const heading = numberValue(value, NaN);
-  if (!Number.isFinite(heading)) return NaN;
-  return ((heading % 360) + 360) % 360;
-}
-
-function gpsTimestampMs(vehicle) {
-  const value = numberValue(
-    vehicle?.gpsTimestamp ?? vehicle?.timestamp ?? 0,
-    0
-  );
-  return value > 0 ? value : 0;
-}
-
-function gpsAgeMs(vehicle) {
-  const timestamp = gpsTimestampMs(vehicle);
-  if (!timestamp) return Infinity;
-  return Math.max(0, Date.now() - timestamp);
-}
-
-function isGpsFresh(vehicle) {
-  return gpsAgeMs(vehicle) <= GPS_FRESHNESS_MS;
-}
-
-function addTrajectorySample(vehicle) {
-  if (!vehicle || !vehicle.vehicleId) return;
-  const timestamp = gpsTimestampMs(vehicle) || Date.now();
-  const history = trajectoryHistory.get(vehicle.vehicleId) || [];
-  const last = history[history.length - 1];
-
-  // Never let repeated or older packets distort trajectory estimates.
-  if (last && timestamp <= last.timestamp) {
-    return;
-  }
-
-  history.push({
-    timestamp,
-    latitude: vehicle.latitude,
-    longitude: vehicle.longitude,
-    speed: numberValue(vehicle.speed),
-    direction: normalizeHeading(vehicle.direction),
-    gpsAccuracy: numberValue(vehicle.gpsAccuracy, Infinity),
-    braking: vehicle.braking === true,
-  });
-
-  const cutoff = Date.now() - TRAJECTORY_MAX_AGE_MS;
-  while (history.length > 0 && history[0].timestamp < cutoff) {
-    history.shift();
-  }
-  while (history.length > TRAJECTORY_MAX_SAMPLES) {
-    history.shift();
-  }
-
-  trajectoryHistory.set(vehicle.vehicleId, history);
-}
-
-function trajectoryEstimate(vehicle) {
-  const history = trajectoryHistory.get(vehicle.vehicleId) || [];
-  const recent = history.slice(-4);
-
-  if (recent.length === 0) {
-    return {
-      samples: 0,
-      speed: numberValue(vehicle.speed),
-      direction: normalizeHeading(vehicle.direction),
-      accelerationKmhPerSec: 0,
-    };
-  }
-
-  const speeds = recent
-    .map((sample) => sample.speed)
-    .filter((value) => Number.isFinite(value));
-
-  const speed = speeds.length
-    ? speeds.reduce((sum, value) => sum + value, 0) / speeds.length
-    : numberValue(vehicle.speed);
-
-  let east = 0;
-  let north = 0;
-  let headingSamples = 0;
-
-  for (const sample of recent) {
-    if (!Number.isFinite(sample.direction)) continue;
-
-    const radians =
-      sample.direction *
-      Math.PI /
-      180;
-
-    east += Math.sin(radians);
-    north += Math.cos(radians);
-    headingSamples++;
-  }
-
-  let direction =
-    normalizeHeading(
-      vehicle.direction
-    );
-
-  if (
-    headingSamples > 0 &&
-    (Math.abs(east) + Math.abs(north)) > 0.01
-  ) {
-    direction =
-      normalizeHeading(
-        Math.atan2(east, north) *
-          180 /
-          Math.PI
-      );
-  }
-
-  let acceleration = 0;
-
-  if (recent.length >= 2) {
-    const previous =
-      recent[recent.length - 2];
-
-    const latest =
-      recent[recent.length - 1];
-
-    const dt =
-      (latest.timestamp -
-        previous.timestamp) /
-      1000;
-
-    if (
-      dt > 0.1 &&
-      dt <= 5
-    ) {
-      acceleration =
-        (latest.speed -
-          previous.speed) /
-        dt;
-    }
-  }
-
-  return {
-    samples: recent.length,
-    speed,
-    direction,
-    accelerationKmhPerSec:
-      acceleration,
-  };
-}
-function calculatePrediction(
-  ownVehicle,
-  nearbyVehicle,
-  distance
-) {
-  const ownEstimate =
-    trajectoryEstimate(
-      ownVehicle
-    );
-
-  const otherEstimate =
-    trajectoryEstimate(
-      nearbyVehicle
-    );
-
-  const ownDirection =
-    ownEstimate.direction;
-
-  const otherDirection =
-    otherEstimate.direction;
-
-  const ownAccuracy =
-    numberValue(
-      ownVehicle.gpsAccuracy,
-      Infinity
-    );
-
-  const otherAccuracy =
-    numberValue(
-      nearbyVehicle.gpsAccuracy,
-      Infinity
-    );
-
-  const fresh =
-    isGpsFresh(ownVehicle) &&
-    isGpsFresh(nearbyVehicle);
-
-  const accurate =
-    ownAccuracy <=
-      MAX_RELIABLE_GPS_ACCURACY &&
-    otherAccuracy <=
-      MAX_RELIABLE_GPS_ACCURACY;
-
-  const directionReliable =
-    Number.isFinite(ownDirection) &&
-    Number.isFinite(otherDirection) &&
-    ownEstimate.speed >= 5 &&
-    otherEstimate.speed >= 5;
-
-  let confidence = 0;
-
-  confidence +=
-    Math.min(
-      35,
-      ownEstimate.samples * 5
-    );
-
-  confidence +=
-    Math.min(
-      20,
-      otherEstimate.samples * 5
-    );
-
-  confidence +=
-    fresh ? 25 : 0;
-
-  if (accurate) {
-    confidence += 15;
-  }
-
-  if (directionReliable) {
-    confidence += 5;
-  }
-
-  confidence =
-    Math.min(
-      100,
-      confidence
-    );
-
-  const result = {
-    confidence,
-
-    gpsAgeSeconds:
-      Number.isFinite(
-        gpsAgeMs(nearbyVehicle)
-      )
-        ? gpsAgeMs(nearbyVehicle) / 1000
-        : -1,
-
-    predictedMissDistanceMeters:
-      distance,
-
-    ttcSeconds:
-      Infinity,
-
-    closingSpeedKmh:
-      0,
-
-    collisionPath:
-      false,
-
-    directionReliable,
-
-    fresh,
-
-    accurate,
-
-    accelerationKmhPerSec:
-      otherEstimate.accelerationKmhPerSec,
-
-    samples:
-      Math.min(
-        ownEstimate.samples,
-        otherEstimate.samples
-      ),
-  };
-
-  if (
-    !fresh ||
-    !accurate ||
-    !directionReliable
-  ) {
-    return result;
-  }
-
-  const otherLatitude =
-    numberValue(
-      nearbyVehicle.latitude,
-      NaN
-    );
-
-  const otherLongitude =
-    numberValue(
-      nearbyVehicle.longitude,
-      NaN
-    );
-
-  const ownLatitude =
-    numberValue(
-      ownVehicle.latitude,
-      NaN
-    );
-
-  const ownLongitude =
-    numberValue(
-      ownVehicle.longitude,
-      NaN
-    );
-
-  if (
-    !isValidCoordinate(
-      otherLatitude,
-      otherLongitude
-    ) ||
-    !isValidCoordinate(
-      ownLatitude,
-      ownLongitude
-    )
-  ) {
-    return result;
-  }
-
-  const meanLatitude =
-    (
-      (
-        ownLatitude +
-        otherLatitude
-      ) / 2
-    ) *
-    Math.PI /
-    180;
-
-  const metersPerLatitudeDegree =
-    111320;
-
-  const metersPerLongitudeDegree =
-    111320 *
-    Math.cos(
-      meanLatitude
-    );
-
-  const relativeEast =
-    (
-      otherLongitude -
-      ownLongitude
-    ) *
-    metersPerLongitudeDegree;
-
-  const relativeNorth =
-    (
-      otherLatitude -
-      ownLatitude
-    ) *
-    metersPerLatitudeDegree;
-
-  const ownRad =
-    ownDirection *
-    Math.PI /
-    180;
-
-  const otherRad =
-    otherDirection *
-    Math.PI /
-    180;
-
-  const ownEast =
-    ownEstimate.speed *
-    Math.sin(ownRad) /
-    3.6;
-
-  const ownNorth =
-    ownEstimate.speed *
-    Math.cos(ownRad) /
-    3.6;
-
-  const otherEast =
-    otherEstimate.speed *
-    Math.sin(otherRad) /
-    3.6;
-
-  const otherNorth =
-    otherEstimate.speed *
-    Math.cos(otherRad) /
-    3.6;
-
-  const relativeEastVelocity =
-    otherEast -
-    ownEast;
-
-  const relativeNorthVelocity =
-    otherNorth -
-    ownNorth;
-
-  const velocitySquared =
-    relativeEastVelocity ** 2 +
-    relativeNorthVelocity ** 2;
-
-  const closingMps =
-    -(
-      relativeEast *
-        relativeEastVelocity +
-      relativeNorth *
-        relativeNorthVelocity
-    ) /
-    Math.max(
-      distance,
-      0.1
-    );
-
-  result.closingSpeedKmh =
-    Math.max(
-      0,
-      closingMps * 3.6
-    );
-
-  const rawTca =
-    velocitySquared > 0.01
-      ? -(
-          relativeEast *
-            relativeEastVelocity +
-          relativeNorth *
-            relativeNorthVelocity
-        ) /
-        velocitySquared
-      : Infinity;
-
-  const tca =
-    Number.isFinite(rawTca) &&
-    rawTca > 0
-      ? rawTca
-      : Infinity;
-
-  if (
-    tca === Infinity ||
-    tca > 10
-  ) {
-    return result;
-  }
-
-  const futureEast =
-    relativeEast +
-    relativeEastVelocity *
-      tca;
-
-  const futureNorth =
-    relativeNorth +
-    relativeNorthVelocity *
-      tca;
-
-  const missDistance =
-    Math.sqrt(
-      futureEast ** 2 +
-      futureNorth ** 2
-    );
-
-  const tolerance =
-    Math.min(
-      8,
-      Math.max(
-        3,
-        3 +
-          (
-            ownEstimate.speed +
-            otherEstimate.speed
-          ) *
-            0.04
-      )
-    );
-
-  result.predictedMissDistanceMeters =
-    missDistance;
-
-  result.collisionPath =
-    missDistance <=
-    tolerance;
-
-  result.ttcSeconds =
-    result.collisionPath
-      ? tca
-      : Infinity;
-
-  return result;
-}
-
-// =====================================================
 // COLLISION RISK
 // =====================================================
 
@@ -872,77 +408,42 @@ function calculateCollisionRisk(
       nearbyVehicle.speed
     );
 
+  const speedDifference =
+    Math.abs(
+      nearbySpeed -
+        ownSpeed
+    );
+
   const nearbyBraking =
     nearbyVehicle.braking ===
     true;
 
-  const prediction =
-    calculatePrediction(
-      ownVehicle,
-      nearbyVehicle,
-      distance
-    );
-
   let risk = "SAFE";
 
-  // CRITICAL is intentionally strict: close range + fresh + accurate GPS.
   if (
     distance <= 5 &&
-    prediction.fresh &&
-    prediction.accurate &&
-    prediction.confidence >= 60
+    nearbySpeed >= 3
   ) {
     risk = "CRITICAL";
   } else if (
-    prediction.collisionPath &&
-    prediction.confidence >= 60 &&
-    Number.isFinite(
-      prediction.ttcSeconds
-    )
+    distance <= 15 &&
+    nearbySpeed >= 3
   ) {
-    if (
-      prediction.ttcSeconds <= 1.5
-    ) {
-      risk = "CRITICAL";
-    } else if (
-      prediction.ttcSeconds <= 3
-    ) {
-      risk = "HIGH";
-    } else if (
-      prediction.ttcSeconds <= 5
-    ) {
-      risk = "MEDIUM";
-    } else if (
-      prediction.ttcSeconds <= 8
-    ) {
-      risk = "EARLY";
-    }
-  }
-
-  // Conservative fallback when trajectory confidence is insufficient.
-  // It can still surface proximity, but cannot manufacture a trajectory-based
-  // emergency from stale/poor GPS.
-  if (risk === "SAFE") {
-    if (
-      distance <= 15 &&
-      nearbySpeed >= 3
-    ) {
-      risk = "HIGH";
-    } else if (
-      distance <= 40 &&
-      nearbySpeed >= 3
-    ) {
-      risk = "MEDIUM";
-    } else if (
-      distance <= 100
-    ) {
-      risk = "EARLY";
-    }
+    risk = "HIGH";
+  } else if (
+    distance <= 30 &&
+    speedDifference >= 8
+  ) {
+    risk = "MEDIUM";
+  } else if (
+    distance <= 50
+  ) {
+    risk = "EARLY";
   }
 
   if (
     nearbyBraking &&
-    distance <= 60 &&
+    distance <= 20 &&
     risk === "EARLY"
   ) {
     risk = "MEDIUM";
@@ -961,109 +462,7 @@ function calculateCollisionRisk(
     nearbySpeed,
 
     nearbyBraking,
-
-    confidence:
-      Number(
-        prediction.confidence.toFixed(0)
-      ),
-
-    ttcSeconds:
-      prediction.ttcSeconds,
-
-    predictedMissDistanceMeters:
-      Number(
-        prediction.predictedMissDistanceMeters.toFixed(1)
-      ),
-
-    collisionPath:
-      prediction.collisionPath,
-
-    closingSpeedKmh:
-      Number(
-        prediction.closingSpeedKmh.toFixed(1)
-      ),
-
-    gpsAgeSeconds:
-      Number(
-        prediction.gpsAgeSeconds.toFixed(1)
-      ),
-
-    accelerationKmhPerSec:
-      Number(
-        prediction.accelerationKmhPerSec.toFixed(2)
-      ),
-
-    trajectorySamples:
-      prediction.samples,
   };
-}
-
-// =====================================================
-// SERVER RISK PERSISTENCE
-// =====================================================
-
-function applyThreatPersistence(
-  ownVehicle,
-  candidate
-) {
-  const key =
-    `${ownVehicle.vehicleId}:${candidate.vehicleId}`;
-
-  const previous =
-    threatPersistence.get(key) || {
-      risk: "SAFE",
-      count: 0,
-      lastSeen: 0,
-    };
-
-  if (
-    candidate.risk ===
-    previous.risk
-  ) {
-    previous.count += 1;
-  } else {
-    previous.risk =
-      candidate.risk;
-
-    previous.count = 1;
-  }
-
-  previous.lastSeen =
-    Date.now();
-
-  threatPersistence.set(
-    key,
-    previous
-  );
-
-  // Never delay a genuine critical condition. Require two consecutive server
-  // observations for non-critical trajectory escalation to suppress one-packet
-  // spikes caused by network/GPS noise.
-  if (
-    candidate.risk === "CRITICAL" ||
-    candidate.risk === "SAFE"
-  ) {
-    return candidate;
-  }
-
-  if (
-    previous.count < 2
-  ) {
-    const downgraded = {
-      ...candidate,
-
-      risk:
-        candidate.risk === "HIGH"
-          ? "MEDIUM"
-          : candidate.risk === "MEDIUM"
-          ? "EARLY"
-          : "SAFE",
-    };
-
-    return downgraded;
-  }
-
-  return candidate;
 }
 
 // =====================================================
@@ -1111,21 +510,6 @@ function buildNearbyVehicleData(
       continue;
     }
 
-    // Step 12: simulated vehicles are intentionally kept alive by the
-    // simulation itself. Real vehicles that have stopped sending socket
-    // updates are excluded here until the cleanup pass removes them.
-    if (
-      !vehicle.simulated &&
-      Date.now() -
-        numberValue(
-          vehicle.lastUpdate,
-          0
-        ) >
-        VEHICLE_EXPIRE_AFTER_MS
-    ) {
-      continue;
-    }
-
     const distance =
       calculateDistanceMeters(
         ownVehicle.latitude,
@@ -1141,8 +525,16 @@ function buildNearbyVehicleData(
       continue;
     }
 
+    // Never expose Firebase UID or
+    // internal socket ID to clients.
+    const {
+      ownerUid: _ownerUid,
+      socketId: _socketId,
+      ...publicVehicle
+    } = vehicle;
+
     nearbyVehicles.push({
-      ...vehicle,
+      ...publicVehicle,
 
       id:
         vehicle.vehicleId,
@@ -1177,43 +569,15 @@ function findPrimaryThreat(
         vehicle
       );
 
-    const candidate =
-      applyThreatPersistence(
-        ownVehicle,
-        {
-          ...vehicle,
+    const candidate = {
+      ...vehicle,
 
-          risk:
-            result.risk,
+      risk:
+        result.risk,
 
-          distance:
-            result.distance,
-
-          confidence:
-            result.confidence,
-
-          ttcSeconds:
-            result.ttcSeconds,
-
-          predictedMissDistanceMeters:
-            result.predictedMissDistanceMeters,
-
-          collisionPath:
-            result.collisionPath,
-
-          closingSpeedKmh:
-            result.closingSpeedKmh,
-
-          gpsAgeSeconds:
-            result.gpsAgeSeconds,
-
-          accelerationKmhPerSec:
-            result.accelerationKmhPerSec,
-
-          trajectorySamples:
-            result.trajectorySamples,
-        }
-      );
+      distance:
+        result.distance,
+    };
 
     if (
       primaryThreat ===
@@ -1314,6 +678,7 @@ function createWarningMessage(
     vehicle.vehicleId
   );
 }
+
 // =====================================================
 // SEND VEHICLE DATA
 // =====================================================
@@ -1407,8 +772,7 @@ function broadcastVehicleData() {
             risk === "CRITICAL" ||
             risk === "HIGH",
 
-          level:
-            risk,
+          level: risk,
 
           risk,
 
@@ -1430,34 +794,6 @@ function broadcastVehicleData() {
           braking:
             primaryThreat.braking ===
             true,
-
-          confidence:
-            primaryThreat.confidence ??
-            0,
-
-          ttcSeconds:
-            primaryThreat.ttcSeconds ??
-            null,
-
-          predictedMissDistanceMeters:
-            primaryThreat.predictedMissDistanceMeters ??
-            null,
-
-          collisionPath:
-            primaryThreat.collisionPath ===
-            true,
-
-          closingSpeedKmh:
-            primaryThreat.closingSpeedKmh ??
-            0,
-
-          gpsAgeSeconds:
-            primaryThreat.gpsAgeSeconds ??
-            -1,
-
-          accelerationKmhPerSec:
-            primaryThreat.accelerationKmhPerSec ??
-            0,
 
           message:
             createWarningMessage(
@@ -1498,20 +834,6 @@ function broadcastPositions() {
       if (
         vehicle.vehicleId ===
         receiver.vehicleId
-      ) {
-        continue;
-      }
-
-      // Step 12: do not send an expired real vehicle to clients.
-      // Simulated vehicles are controlled by the simulation timers.
-      if (
-        !vehicle.simulated &&
-        Date.now() -
-          numberValue(
-            vehicle.lastUpdate,
-            0
-          ) >
-          VEHICLE_EXPIRE_AFTER_MS
       ) {
         continue;
       }
@@ -1560,7 +882,6 @@ function broadcastPositions() {
 // =====================================================
 
 function updateAllClients() {
-  cleanupStaleVehicles();
   broadcastVehicleData();
   broadcastPositions();
 }
@@ -1585,27 +906,6 @@ function removeVehicle(
     vehicleId
   );
 
-  trajectoryHistory.delete(
-    vehicleId
-  );
-
-  threatPersistence.forEach(
-    (_value, key) => {
-      if (
-        key.startsWith(
-          `${vehicleId}:`
-        ) ||
-        key.endsWith(
-          `:${vehicleId}`
-        )
-      ) {
-        threatPersistence.delete(
-          key
-        );
-      }
-    }
-  );
-
   io.emit(
     "vehicleRemoved",
     {
@@ -1614,82 +914,6 @@ function removeVehicle(
   );
 
   return true;
-}
-
-// =====================================================
-// STEP 12 — STALE VEHICLE CLEANUP
-// =====================================================
-
-function cleanupStaleVehicles() {
-  const now =
-    Date.now();
-
-  for (
-    const [
-      vehicleId,
-      vehicle,
-    ]
-    of vehicles.entries()
-  ) {
-    // Simulated vehicles do not use socket update timestamps.
-    if (
-      vehicle.simulated
-    ) {
-      continue;
-    }
-
-    const lastUpdate =
-      numberValue(
-        vehicle.lastUpdate,
-        0
-      );
-
-    if (
-      !lastUpdate ||
-      now - lastUpdate >
-        VEHICLE_EXPIRE_AFTER_MS
-    ) {
-      console.log(
-        "🧹 REMOVING STALE VEHICLE:",
-        vehicleId,
-        `last update ${lastUpdate ? now - lastUpdate : "unknown"} ms ago`
-      );
-
-      vehicles.delete(
-        vehicleId
-      );
-
-      trajectoryHistory.delete(
-        vehicleId
-      );
-
-      threatPersistence.forEach(
-        (_value, key) => {
-          if (
-            key.startsWith(
-              `${vehicleId}:`
-            ) ||
-            key.endsWith(
-              `:${vehicleId}`
-            )
-          ) {
-            threatPersistence.delete(
-              key
-            );
-          }
-        }
-      );
-
-      io.emit(
-        "vehicleRemoved",
-        {
-          vehicleId,
-          reason:
-            "stale_timeout",
-        }
-      );
-    }
-  }
 }
 
 // =====================================================
@@ -1872,30 +1096,20 @@ function startSingleSimulation() {
         if (
           step < 20
         ) {
-          vehicle.speed =
-            20;
-
-          vehicle.braking =
-            false;
+          vehicle.speed = 20;
+          vehicle.braking = false;
         } else if (
           step < 35
         ) {
-          vehicle.speed =
-            35;
-
-          vehicle.braking =
-            false;
+          vehicle.speed = 35;
+          vehicle.braking = false;
         } else if (
           step < 45
         ) {
-          vehicle.speed =
-            45;
-
-          vehicle.braking =
-            false;
+          vehicle.speed = 45;
+          vehicle.braking = false;
         } else {
-          vehicle.speed =
-            50;
+          vehicle.speed = 50;
 
           vehicle.braking =
             step % 8 === 0;
@@ -1994,6 +1208,7 @@ function createTrafficVehicle(
       null,
   };
 }
+
 // =====================================================
 // START TRAFFIC SIMULATION
 // =====================================================
@@ -2087,10 +1302,8 @@ function startTrafficSimulation(
             0.00000015;
 
           const radians =
-            (
-              vehicle.direction *
-              Math.PI
-            ) /
+            (vehicle.direction *
+              Math.PI) /
             180;
 
           vehicle.latitude +=
@@ -2115,8 +1328,7 @@ function startTrafficSimulation(
             vehicle.speed =
               Math.max(
                 0,
-                vehicle.speed -
-                  8
+                vehicle.speed - 8
               );
           } else {
             vehicle.braking =
@@ -2350,30 +1562,6 @@ io.engine.on(
 );
 
 // =====================================================
-// STEP 12 — PERIODIC STALE CLEANUP
-// =====================================================
-
-// Socket.IO's disconnect event is normally enough, but it is not the only
-// failure mode. This independent timer guarantees that abandoned real
-// vehicles eventually disappear even if a disconnect event is delayed.
-const staleCleanupTimer =
-  setInterval(
-    () => {
-      cleanupStaleVehicles();
-
-      updateAllClients();
-    },
-    STALE_CLEANUP_INTERVAL_MS
-  );
-
-if (
-  typeof staleCleanupTimer.unref ===
-  "function"
-) {
-  staleCleanupTimer.unref();
-}
-
-// =====================================================
 // SOCKET CONNECTION
 // =====================================================
 
@@ -2382,12 +1570,69 @@ io.on(
   (socket) => {
     console.log(
       "🔌 V2V CLIENT CONNECTED:",
-      socket.id
+      socket.id,
+      "UID:",
+      socket.uid
     );
 
-    // -------------------------------------------------
+    // =================================================
+    // REFRESH FIREBASE AUTH TOKEN
+    // =================================================
+
+    socket.on(
+      "refreshAuth",
+      async (data) => {
+        try {
+          const token =
+            data?.token;
+
+          if (
+            typeof token !==
+              "string" ||
+            !token.trim()
+          ) {
+            throw new Error(
+              "Missing Firebase ID token"
+            );
+          }
+
+          const decodedToken =
+            await firebaseAuth.verifyIdToken(
+              token.trim()
+            );
+
+          if (
+            decodedToken.uid !==
+            socket.uid
+          ) {
+            throw new Error(
+              "Firebase user changed"
+            );
+          }
+
+          socket.user =
+            decodedToken;
+
+          socket.emit(
+            "authRefreshSuccess"
+          );
+        } catch (error) {
+          console.warn(
+            "SOCKET AUTH REFRESH REJECTED:",
+            error.code ||
+              error.message
+          );
+
+          socket.disconnect(
+            true
+          );
+        }
+      }
+    );
+
+    // =================================================
     // REGISTER VEHICLE
-    // -------------------------------------------------
+    // =================================================
 
     socket.on(
       "registerVehicle",
@@ -2443,8 +1688,27 @@ io.on(
             vehicleId
           );
 
-        // If the same vehicle reconnects, replace
-        // the old socket ownership.
+        // Prevent another Firebase user from
+        // claiming an existing vehicle ID.
+        if (
+          previousVehicle &&
+          previousVehicle.ownerUid &&
+          previousVehicle.ownerUid !==
+            socket.uid
+        ) {
+          socket.emit(
+            "registrationError",
+            {
+              message:
+                "Vehicle ID is already registered to another user.",
+            }
+          );
+
+          return;
+        }
+
+        // If the same vehicle reconnects,
+        // replace its old socket.
         if (
           previousVehicle &&
           previousVehicle.socketId &&
@@ -2470,6 +1734,9 @@ io.on(
         }
 
         const vehicle = {
+          ownerUid:
+            socket.uid,
+
           vehicleId,
 
           id:
@@ -2524,31 +1791,6 @@ io.on(
           vehicle
         );
 
-        trajectoryHistory.delete(
-          vehicleId
-        );
-
-        threatPersistence.forEach(
-          (_value, key) => {
-            if (
-              key.startsWith(
-                `${vehicleId}:`
-              ) ||
-              key.endsWith(
-                `:${vehicleId}`
-              )
-            ) {
-              threatPersistence.delete(
-                key
-              );
-            }
-          }
-        );
-
-        addTrajectorySample(
-          vehicle
-        );
-
         console.log(
           "✅ VEHICLE REGISTERED:",
           vehicleId,
@@ -2566,9 +1808,9 @@ io.on(
       }
     );
 
-    // -------------------------------------------------
+    // =================================================
     // VEHICLE UPDATE
-    // -------------------------------------------------
+    // =================================================
 
     socket.on(
       "vehicleUpdate",
@@ -2591,12 +1833,16 @@ io.on(
           return;
         }
 
+        // Both Firebase ownership AND socket
+        // ownership must match.
         if (
+          vehicle.ownerUid !==
+            socket.uid ||
           vehicle.socketId !==
-          socket.id
+            socket.id
         ) {
           console.warn(
-            "REJECTED vehicleUpdate: socket mismatch",
+            "REJECTED vehicleUpdate: ownership/socket mismatch",
             vehicleId
           );
 
@@ -2649,31 +1895,15 @@ io.on(
         vehicle.gpsAccuracy =
           numberValue(
             data.gpsAccuracy,
-            vehicle.gpsAccuracy ??
-              Infinity
+            vehicle.gpsAccuracy
           );
 
-        const incomingGpsTimestamp =
+        vehicle.gpsTimestamp =
           numberValue(
             data.gpsTimestamp,
-            vehicle.gpsTimestamp ??
-              Date.now()
+            Date.now()
           );
 
-        if (
-          incomingGpsTimestamp >=
-          (
-            vehicle.gpsTimestamp ??
-            0
-          )
-        ) {
-          vehicle.gpsTimestamp =
-            incomingGpsTimestamp;
-        }
-
-        // Step 12: lastUpdate measures actual socket/application liveness.
-        // Do not use gpsTimestamp here because GPS timestamps and server
-        // receipt time are different clocks.
         vehicle.lastUpdate =
           Date.now();
 
@@ -2682,16 +1912,67 @@ io.on(
           vehicle
         );
 
-        addTrajectorySample(
+        updateAllClients();
+      }
+    );
+
+    // =================================================
+    // VEHICLE STATUS UPDATE
+    // =================================================
+
+    socket.on(
+      "vehicleStatusUpdate",
+      (data) => {
+        const vehicleId =
+          data?.vehicleId
+            ?.toString()
+            .trim();
+
+        if (!vehicleId) {
+          return;
+        }
+
+        const vehicle =
+          vehicles.get(
+            vehicleId
+          );
+
+        if (!vehicle) {
+          return;
+        }
+
+        if (
+          vehicle.ownerUid !==
+            socket.uid ||
+          vehicle.socketId !==
+            socket.id
+        ) {
+          return;
+        }
+
+        if (
+          typeof data.status ===
+          "string"
+        ) {
+          vehicle.status =
+            data.status;
+        }
+
+        vehicle.lastUpdate =
+          Date.now();
+
+        vehicles.set(
+          vehicleId,
           vehicle
         );
 
         updateAllClients();
       }
     );
-        // -------------------------------------------------
+
+    // =================================================
     // DISCONNECT
-    // -------------------------------------------------
+    // =================================================
 
     socket.on(
       "disconnect",
@@ -2720,27 +2001,6 @@ io.on(
 
             vehicles.delete(
               vehicleId
-            );
-
-            trajectoryHistory.delete(
-              vehicleId
-            );
-
-            threatPersistence.forEach(
-              (_value, key) => {
-                if (
-                  key.startsWith(
-                    `${vehicleId}:`
-                  ) ||
-                  key.endsWith(
-                    `:${vehicleId}`
-                  )
-                ) {
-                  threatPersistence.delete(
-                    key
-                  );
-                }
-              }
             );
 
             break;
@@ -2790,9 +2050,7 @@ server.listen(
     );
 
     console.log(
-      V2V_SHARED_SECRET
-        ? "AUTH: shared-secret enabled"
-        : "AUTH: disabled"
+      "AUTH: Firebase ID token required"
     );
 
     console.log(

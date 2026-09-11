@@ -1,0 +1,28 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /vehicles/{vehicleId} {
+      // The current app's live map reads the vehicles collection.
+      // Therefore authenticated users can read vehicle documents.
+      allow read: if request.auth != null;
+
+      // A vehicle can only be created under the authenticated user's UID.
+      allow create: if request.auth != null
+                    && request.resource.data.ownerUid == request.auth.uid
+                    && request.resource.data.vehicleId == vehicleId;
+
+      // Only the current owner can update the vehicle.
+      // The ownerUid cannot be transferred to another user.
+      allow update: if request.auth != null
+                    && resource.data.ownerUid == request.auth.uid
+                    && request.resource.data.ownerUid == request.auth.uid
+                    && request.resource.data.vehicleId == vehicleId;
+
+      // Only the owner can delete the vehicle.
+      allow delete: if request.auth != null
+                    && resource.data.ownerUid == request.auth.uid;
+    }
+  }
+}

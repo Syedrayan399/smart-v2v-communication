@@ -3,12 +3,12 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'firebase_options.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:just_audio/just_audio.dart';
+import 'package:flutter/services.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
@@ -28,6 +28,11 @@ Future<void> main() async {
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+
+  // Production identity: every app installation gets a Firebase UID.
+  // This UID is later stored as ownerUid on the vehicle document so
+  // Firestore rules can enforce vehicle ownership.
+  await FirebaseAuth.instance.signInAnonymously();
 
   runApp(
     const V2VApp(),
@@ -69,6 +74,27 @@ class V2VHomePage extends StatefulWidget {
       _V2VHomePageState();
 }
 
+
+class _VehicleTrajectorySample {
+  const _VehicleTrajectorySample({
+    required this.timestamp,
+    required this.latitude,
+    required this.longitude,
+    required this.speedKmh,
+    required this.headingDegrees,
+    required this.accuracyMeters,
+    required this.braking,
+  });
+
+  final DateTime timestamp;
+  final double latitude;
+  final double longitude;
+  final double speedKmh;
+  final double? headingDegrees;
+  final double accuracyMeters;
+  final bool braking;
+}
+
 class _V2VHomePageState
     extends State<V2VHomePage> {
   // =====================================================
@@ -78,8 +104,16 @@ class _V2VHomePageState
   final V2VService v2vService =
       V2VService();
 
-  final AudioPlayer collisionAudioPlayer =
-      AudioPlayer();
+  // Firebase identity used to own this vehicle's Firestore document.
+  String get ownerUid =>
+      FirebaseAuth.instance.currentUser?.uid ?? '';
+
+  // Native Android collision audio. The Android side uses
+  // AudioAttributes.USAGE_NOTIFICATION, so the alert uses the phone's
+  // notification/alert volume without creating a notification card.
+  static const MethodChannel _collisionAudioChannel =
+      MethodChannel('v2v_collision_audio');
+
 
   final MapController mapController =
       MapController();
@@ -96,12 +130,14 @@ class _V2VHomePageState
       _firestoreVehicleSubscription;
 
   bool _firestoreLiveMapActive = false;
+  bool _fullRefreshInProgress = false;
 
   // Fast V2V synchronization. GPS hardware decides when a truly new
   // satellite fix is available, but the app checks and publishes the
   // latest position every second.
   Timer? _gpsPollingTimer;
   Timer? _v2vSyncTimer;
+  Timer? _liveMapPruneTimer;
   bool _gpsPollInProgress = false;
 
   // Vehicle updates are throttled to a single choke point so the GPS
@@ -270,6 +306,35 @@ class _V2VHomePageState
   // This reduces 80 m -> 20 m -> 5 m style jumps caused by noisy GPS fixes.
   static const int _locationSmoothingWindow = 5;
   final List<Position> _recentAccuratePositions = <Position>[];
+
+
+  // =====================================================
+  // TRAJECTORY HISTORY / PREDICTION SMOOTHING
+  // =====================================================
+
+  // Keep only a short rolling history. This is deliberately small so the
+  // safety model reacts quickly while rejecting one-frame GPS spikes.
+  final Map<String, List<_VehicleTrajectorySample>>
+      _vehicleTrajectoryHistory =
+      <String, List<_VehicleTrajectorySample>>{};
+
+  // Last accepted risk candidate for each vehicle. This adds temporal
+  // persistence without delaying a genuinely critical event.
+  final Map<String, String> _vehicleRiskCandidates =
+      <String, String>{};
+
+  final Map<String, int> _vehicleRiskConfirmations =
+      <String, int>{};
+
+  static const Duration _trajectoryHistoryWindow =
+      Duration(seconds: 10);
+
+  static const int _maxTrajectorySamples = 8;
+
+  // A prediction normally needs two consecutive observations before it is
+  // promoted to a non-critical warning. CRITICAL remains immediate when the
+  // measured geometry is genuinely dangerous.
+  static const int _requiredStableRiskConfirmations = 2;
 
 
   // =====================================================
@@ -617,6 +682,810 @@ class _V2VHomePageState
     );
   }
 
+
+  double? _getVehicleDirection(
+    Map<String, dynamic>? vehicle,
+  ) {
+    if (vehicle == null) {
+      return null;
+    }
+
+    final double value = _toDouble(
+      vehicle['direction'] ??
+          vehicle['heading'] ??
+          vehicle['bearing'],
+      fallback: double.nan,
+    );
+
+    if (!value.isFinite) {
+      return null;
+    }
+
+    return value % 360;
+  }
+
+  double _normalizeAngleDifference(
+    double first,
+    double second,
+  ) {
+    double difference = (first - second) % 360;
+    if (difference > 180) {
+      difference -= 360;
+    }
+    return difference.abs();
+  }
+
+  double _clampDouble(
+    double value,
+    double minimum,
+    double maximum,
+  ) {
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+  }
+
+  // Returns the age of a remote GPS fix in seconds. Negative ages are treated
+  // as zero so a small device/server clock difference does not make a fresh
+  // update look stale.
+  double _getVehicleGpsAgeSeconds(
+    Map<String, dynamic> vehicle,
+  ) {
+    final int timestamp = _toInt(
+      vehicle['gpsTimestamp'] ??
+          vehicle['timestamp'] ??
+          vehicle['updatedAtMs'],
+      fallback: 0,
+    );
+
+    if (timestamp <= 0) {
+      return double.infinity;
+    }
+
+    final double age =
+        DateTime.now().millisecondsSinceEpoch / 1000 -
+            timestamp / 1000;
+
+    return age < 0 ? 0 : age;
+  }
+
+  bool _isRemoteGpsFresh(
+    Map<String, dynamic> vehicle,
+  ) {
+    return _getVehicleGpsAgeSeconds(vehicle) <= 4.0;
+  }
+
+  double _getVehicleGpsAccuracy(Map<String, dynamic> vehicle) {
+    final double value = _toDouble(
+      vehicle['gpsAccuracy'] ?? vehicle['accuracy'],
+      fallback: double.infinity,
+    );
+    return value.isFinite && value >= 0 ? value : double.infinity;
+  }
+
+  double _combinedPositionUncertaintyMeters(Map<String, dynamic> vehicle) {
+    final double remoteAccuracy = _getVehicleGpsAccuracy(vehicle);
+    if (!gpsAccuracyMeters.isFinite || !remoteAccuracy.isFinite) {
+      return double.infinity;
+    }
+    return sqrt(
+      gpsAccuracyMeters * gpsAccuracyMeters +
+          remoteAccuracy * remoteAccuracy,
+    );
+  }
+
+  double _gpsConfidenceForVehicle(Map<String, dynamic> vehicle) {
+    final double remoteAccuracy = _getVehicleGpsAccuracy(vehicle);
+    final double remoteAge = _getVehicleGpsAgeSeconds(vehicle);
+    double confidence = 0;
+
+    if (gpsAccuracyMeters <= 5) {
+      confidence += 30;
+    } else if (gpsAccuracyMeters <= 10) {
+      confidence += 24;
+    } else if (gpsAccuracyMeters <= 20) {
+      confidence += 15;
+    }
+
+    if (remoteAccuracy <= 5) {
+      confidence += 30;
+    } else if (remoteAccuracy <= 10) {
+      confidence += 24;
+    } else if (remoteAccuracy <= 20) {
+      confidence += 15;
+    }
+
+    if (remoteAge <= 1) {
+      confidence += 20;
+    } else if (remoteAge <= 2) {
+      confidence += 15;
+    } else if (remoteAge <= 4) {
+      confidence += 8;
+    }
+
+    if (lastGpsUpdate != null) {
+      final int ownAgeMs = DateTime.now()
+          .difference(lastGpsUpdate!)
+          .inMilliseconds;
+      if (ownAgeMs <= 1000) {
+        confidence += 20;
+      } else if (ownAgeMs <= 2000) {
+        confidence += 15;
+      } else if (ownAgeMs <= 4000) {
+        confidence += 8;
+      }
+    }
+
+    return _clampDouble(confidence, 0, 100);
+  }
+
+  // Bearing from our vehicle to the other vehicle.
+  // 0° = north, 90° = east, 180° = south, 270° = west.
+  double _bearingToVehicle(
+    Map<String, dynamic> vehicle,
+  ) {
+    final double? otherLatitude =
+        _getVehicleLatitude(vehicle);
+    final double? otherLongitude =
+        _getVehicleLongitude(vehicle);
+
+    if (otherLatitude == null ||
+        otherLongitude == null ||
+        !_hasValidCoordinates(latitude, longitude) ||
+        !_hasValidCoordinates(otherLatitude, otherLongitude)) {
+      return double.nan;
+    }
+
+    final double lat1 = latitude * pi / 180;
+    final double lat2 = otherLatitude * pi / 180;
+    final double deltaLongitude =
+        (otherLongitude - longitude) * pi / 180;
+
+    final double y =
+        sin(deltaLongitude) * cos(lat2);
+    final double x =
+        cos(lat1) * sin(lat2) -
+        sin(lat1) * cos(lat2) * cos(deltaLongitude);
+
+    final double bearing = atan2(y, x) * 180 / pi;
+    return (bearing + 360) % 360;
+  }
+
+  // Smart collision geometry.
+  //
+  // Instead of assuming that every nearby vehicle is on the same road, this
+  // models both vehicles as moving points in a local north/east plane. It
+  // calculates relative velocity, time to closest approach, and the predicted
+  // miss distance. This handles:
+  //   * head-on traffic
+  //   * same-direction following/overtaking
+  //   * crossing paths
+  //   * different speeds
+  //   * large heading differences
+  //   * stale remote GPS data
+  //
+  // It is still a safety heuristic, not lane-level autonomous-driving logic.
+  Map<String, double> _calculateCollisionPrediction(
+    Map<String, dynamic> vehicle,
+    double distance,
+  ) {
+    final Map<String, double> trajectoryEstimate =
+        _getTrajectoryEstimate(vehicle);
+
+    final double otherSpeedKmh =
+        trajectoryEstimate['speedKmh'] ?? _getVehicleSpeed(vehicle);
+
+    final double estimatedHeading =
+        trajectoryEstimate['headingDegrees'] ?? double.nan;
+
+    final double? rawOtherDirection =
+        _getVehicleDirection(vehicle);
+
+    final double? otherDirection =
+        estimatedHeading.isFinite
+            ? estimatedHeading
+            : rawOtherDirection;
+
+    final double ownDirection =
+        direction.isFinite ? direction % 360 : double.nan;
+
+    final double gpsAgeSeconds = _getVehicleGpsAgeSeconds(vehicle);
+    final bool remoteFresh = gpsAgeSeconds <= 4.0;
+    final bool ownFresh = lastGpsUpdate != null &&
+        DateTime.now().difference(lastGpsUpdate!).inMilliseconds <= 4000;
+
+    final double otherAccuracy = _toDouble(
+      vehicle['gpsAccuracy'] ?? vehicle['accuracy'],
+      fallback: double.infinity,
+    );
+
+    final bool accuracyReliable =
+        gpsAccuracyMeters <= 20.0 &&
+        otherAccuracy.isFinite &&
+        otherAccuracy <= 20.0;
+
+    final bool directionReliable =
+        ownDirection.isFinite &&
+        otherDirection != null &&
+        speed >= 5.0 &&
+        otherSpeedKmh >= 5.0 &&
+        remoteFresh &&
+        ownFresh &&
+        accuracyReliable;
+
+    final double headingDifference =
+        otherDirection == null || !ownDirection.isFinite
+            ? double.nan
+            : _normalizeAngleDifference(
+                ownDirection,
+                otherDirection,
+              );
+
+    final Map<String, double> base = <String, double>{
+      'distanceMeters': distance,
+      'otherSpeedKmh': otherSpeedKmh,
+      'closingSpeedKmh': 0,
+      'closingSpeedMps': 0,
+      'ttcSeconds': double.infinity,
+      'timeToClosestApproachSeconds': double.infinity,
+      'predictedMissDistanceMeters': distance,
+      'headingDifferenceDegrees': headingDifference,
+      'longitudinalMeters': 0,
+      'lateralMeters': distance,
+      'approaching': 0,
+      'collisionPath': 0,
+      'directionReliable': directionReliable ? 1 : 0,
+      'remoteFresh': remoteFresh ? 1 : 0,
+      'gpsAgeSeconds': gpsAgeSeconds.isFinite ? gpsAgeSeconds : -1,
+      'accuracyReliable': accuracyReliable ? 1 : 0,
+      'confidence': trajectoryEstimate['confidence'] ?? 0,
+      'historySamples': trajectoryEstimate['sampleCount'] ?? 0,
+      'historySpanSeconds':
+          trajectoryEstimate['historySpanSeconds'] ?? 0,
+      'accelerationKmhPerSec':
+          trajectoryEstimate['accelerationKmhPerSec'] ?? 0,
+      'headingConsistencyDegrees':
+          trajectoryEstimate['headingConsistencyDegrees'] ??
+              double.infinity,
+      'remoteAccuracyMeters': otherAccuracy.isFinite ? otherAccuracy : -1,
+      'combinedUncertaintyMeters': _combinedPositionUncertaintyMeters(vehicle).isFinite
+          ? _combinedPositionUncertaintyMeters(vehicle)
+          : -1,
+      'gpsConfidence': _gpsConfidenceForVehicle(vehicle),
+    };
+
+    if (!distance.isFinite ||
+        distance < 0 ||
+        !directionReliable) {
+      return base;
+    }
+
+    final double? otherLatitude = _getVehicleLatitude(vehicle);
+    final double? otherLongitude = _getVehicleLongitude(vehicle);
+    if (otherLatitude == null || otherLongitude == null) {
+      return base;
+    }
+
+    // Convert the small local displacement to metres. East/north coordinates
+    // are sufficiently accurate for the <=150 m detection range.
+    final double meanLatitude =
+        ((latitude + otherLatitude) / 2) * pi / 180;
+    const double metersPerDegreeLatitude = 111320.0;
+    final double metersPerDegreeLongitude =
+        111320.0 * cos(meanLatitude);
+
+    final double relativeEast =
+        (otherLongitude - longitude) * metersPerDegreeLongitude;
+    final double relativeNorth =
+        (otherLatitude - latitude) * metersPerDegreeLatitude;
+
+    final double ownRadians = ownDirection * pi / 180;
+    final double otherRadians = otherDirection! * pi / 180;
+
+    // Heading convention: 0=north, 90=east.
+    final double ownEast = speed * sin(ownRadians) / 3.6;
+    final double ownNorth = speed * cos(ownRadians) / 3.6;
+    final double otherEast = otherSpeedKmh * sin(otherRadians) / 3.6;
+    final double otherNorth = otherSpeedKmh * cos(otherRadians) / 3.6;
+
+    final double relativeEastVelocity = otherEast - ownEast;
+    final double relativeNorthVelocity = otherNorth - ownNorth;
+    final double relativeVelocitySquared =
+        relativeEastVelocity * relativeEastVelocity +
+        relativeNorthVelocity * relativeNorthVelocity;
+
+    // Positive closing speed means distance is shrinking now.
+    final double closingSpeedMps =
+        -((relativeEast * relativeEastVelocity) +
+                (relativeNorth * relativeNorthVelocity)) /
+            max(distance, 0.1);
+    final double closingSpeedKmh = closingSpeedMps * 3.6;
+
+    // Time until the two trajectory points are closest. Clamp to a short
+    // forward horizon; a vehicle that passed the closest point is not a threat.
+    final double rawTimeToClosest =
+        relativeVelocitySquared > 0.01
+            ? -((relativeEast * relativeEastVelocity) +
+                    (relativeNorth * relativeNorthVelocity)) /
+                relativeVelocitySquared
+            : double.infinity;
+
+    final double timeToClosest =
+        rawTimeToClosest.isFinite && rawTimeToClosest > 0
+            ? rawTimeToClosest
+            : double.infinity;
+
+    double predictedMissDistance = distance;
+    if (timeToClosest.isFinite) {
+      final double futureEast =
+          relativeEast + relativeEastVelocity * timeToClosest;
+      final double futureNorth =
+          relativeNorth + relativeNorthVelocity * timeToClosest;
+      predictedMissDistance =
+          sqrt(futureEast * futureEast + futureNorth * futureNorth);
+    }
+
+    // Longitudinal/lateral position relative to our own travel direction.
+    // This is what separates following/overtaking from side-on crossing.
+    final double ownForwardEast = sin(ownRadians);
+    final double ownForwardNorth = cos(ownRadians);
+    final double ownLateralEast = cos(ownRadians);
+    final double ownLateralNorth = -sin(ownRadians);
+
+    final double longitudinalMeters =
+        relativeEast * ownForwardEast +
+        relativeNorth * ownForwardNorth;
+    final double lateralMeters =
+        (relativeEast * ownLateralEast +
+                relativeNorth * ownLateralNorth)
+            .abs();
+
+    // Collision path requires a small predicted miss distance. The tolerance
+    // grows slightly with speed because GPS/heading uncertainty grows in fast
+    // motion, but is capped to prevent huge false-positive corridors.
+    final double pathTolerance = _clampDouble(
+      3.0 + (speed + otherSpeedKmh) * 0.04,
+      3.0,
+      8.0,
+    );
+
+    final bool collisionPath =
+        timeToClosest.isFinite &&
+        timeToClosest <= 10.0 &&
+        predictedMissDistance <= pathTolerance;
+
+    // TTC is meaningful only for an actual predicted path conflict. For a
+    // crossing vehicle, radial closing speed alone can be misleading, so use
+    // closest-approach time when the trajectories intersect.
+    final double ttcSeconds =
+        collisionPath && timeToClosest.isFinite
+            ? timeToClosest
+            : (closingSpeedMps > 0.5
+                ? distance / closingSpeedMps
+                : double.infinity);
+
+    // A vehicle behind us and moving in the same direction can be overtaking;
+    // it is a threat only if the longitudinal gap is closing and lateral offset
+    // is small enough to enter our path.
+    final bool sameDirection = headingDifference <= 30.0;
+    final bool overtakingOrFollowing =
+        sameDirection &&
+        longitudinalMeters < -2.0 &&
+        closingSpeedMps > 0.5 &&
+        lateralMeters <= pathTolerance;
+
+    // Head-on and crossing traffic are represented by the trajectory model.
+    // Do not call every opposite-heading vehicle dangerous merely because it is
+    // close; its predicted miss distance must also be small.
+    final bool actualApproach =
+        collisionPath || overtakingOrFollowing || closingSpeedMps > 2.0;
+
+    base['closingSpeedKmh'] = max(0, closingSpeedKmh);
+    base['closingSpeedMps'] = max(0, closingSpeedMps);
+    base['ttcSeconds'] = ttcSeconds;
+    base['timeToClosestApproachSeconds'] = timeToClosest;
+    base['predictedMissDistanceMeters'] = predictedMissDistance;
+    base['longitudinalMeters'] = longitudinalMeters;
+    base['lateralMeters'] = lateralMeters;
+    base['approaching'] = actualApproach ? 1 : 0;
+    base['collisionPath'] = collisionPath ? 1 : 0;
+
+    return base;
+  }
+
+  String _formatTtc(
+    double ttcSeconds,
+  ) {
+    if (!ttcSeconds.isFinite || ttcSeconds <= 0) {
+      return 'No predicted collision';
+    }
+
+    if (ttcSeconds < 10) {
+      return '${ttcSeconds.toStringAsFixed(1)} s';
+    }
+
+    return '${ttcSeconds.toStringAsFixed(0)} s';
+  }
+
+
+  DateTime? _getVehicleGpsTimestamp(
+    Map<String, dynamic> vehicle,
+  ) {
+    final int timestamp = _toInt(
+      vehicle['gpsTimestamp'] ??
+          vehicle['timestamp'] ??
+          vehicle['updatedAtMs'],
+      fallback: 0,
+    );
+
+    if (timestamp <= 0) {
+      return null;
+    }
+
+    return DateTime.fromMillisecondsSinceEpoch(timestamp);
+  }
+
+  double _circularMeanHeading(
+    List<double> headings,
+  ) {
+    if (headings.isEmpty) {
+      return double.nan;
+    }
+
+    double sinSum = 0;
+    double cosSum = 0;
+
+    for (final double heading in headings) {
+      final double radians = heading * pi / 180;
+      sinSum += sin(radians);
+      cosSum += cos(radians);
+    }
+
+    final double mean = atan2(sinSum, cosSum) * 180 / pi;
+    return (mean + 360) % 360;
+  }
+
+  double _median(
+    List<double> values,
+  ) {
+    if (values.isEmpty) {
+      return 0;
+    }
+
+    final List<double> sorted = List<double>.from(values)
+      ..sort();
+
+    final int middle = sorted.length ~/ 2;
+
+    if (sorted.length.isOdd) {
+      return sorted[middle];
+    }
+
+    return (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+
+  void _recordVehicleTrajectory(
+    Map<String, dynamic> vehicle,
+  ) {
+    final String id = _getVehicleId(vehicle);
+
+    if (id.isEmpty || id == 'UNKNOWN') {
+      return;
+    }
+
+    final double? lat = _getVehicleLatitude(vehicle);
+    final double? lng = _getVehicleLongitude(vehicle);
+
+    if (lat == null ||
+        lng == null ||
+        !_hasValidCoordinates(lat, lng)) {
+      return;
+    }
+
+    final DateTime timestamp =
+        _getVehicleGpsTimestamp(vehicle) ?? DateTime.now();
+
+    final double speedKmh = max(0, _getVehicleSpeed(vehicle));
+    final double? heading = _getVehicleDirection(vehicle);
+    final double accuracy = _toDouble(
+      vehicle['gpsAccuracy'] ?? vehicle['accuracy'],
+      fallback: double.infinity,
+    );
+
+    final _VehicleTrajectorySample sample =
+        _VehicleTrajectorySample(
+      timestamp: timestamp,
+      latitude: lat,
+      longitude: lng,
+      speedKmh: speedKmh,
+      headingDegrees: heading,
+      accuracyMeters: accuracy,
+      braking: vehicle['braking'] == true,
+    );
+
+    final List<_VehicleTrajectorySample> history =
+        _vehicleTrajectoryHistory.putIfAbsent(
+      id,
+      () => <_VehicleTrajectorySample>[],
+    );
+
+    // Ignore duplicate or out-of-order GPS timestamps. Socket and backend
+    // callbacks can deliver the same snapshot through more than one path.
+    if (history.isNotEmpty) {
+      final DateTime lastTimestamp = history.last.timestamp;
+
+      if (!timestamp.isAfter(lastTimestamp)) {
+        return;
+      }
+    }
+
+    history.add(sample);
+
+    final DateTime cutoff =
+        timestamp.subtract(_trajectoryHistoryWindow);
+
+    history.removeWhere(
+      (_VehicleTrajectorySample item) =>
+          item.timestamp.isBefore(cutoff),
+    );
+
+    while (history.length > _maxTrajectorySamples) {
+      history.removeAt(0);
+    }
+  }
+
+  Map<String, double> _getTrajectoryEstimate(
+    Map<String, dynamic> vehicle,
+  ) {
+    final String id = _getVehicleId(vehicle);
+    final List<_VehicleTrajectorySample> history =
+        _vehicleTrajectoryHistory[id] ??
+            <_VehicleTrajectorySample>[];
+
+    final double rawSpeed = max(0, _getVehicleSpeed(vehicle));
+    final double? rawHeading = _getVehicleDirection(vehicle);
+
+    if (history.isEmpty) {
+      return <String, double>{
+        'speedKmh': rawSpeed,
+        'headingDegrees':
+            rawHeading?.toDouble() ?? double.nan,
+        'accelerationKmhPerSec': 0,
+        'confidence': 0,
+        'sampleCount': 0,
+        'historySpanSeconds': 0,
+        'headingConsistencyDegrees': double.infinity,
+      };
+    }
+
+    final List<_VehicleTrajectorySample> recent =
+        history.length <= 5
+            ? List<_VehicleTrajectorySample>.from(history)
+            : history.sublist(history.length - 5);
+
+    final List<double> speeds =
+        recent.map((sample) => sample.speedKmh).toList();
+
+    final double smoothedSpeed = _median(speeds);
+
+    final List<double> headings = recent
+        .where(
+          (sample) =>
+              sample.headingDegrees != null &&
+              sample.speedKmh >= 5,
+        )
+        .map(
+          (sample) => sample.headingDegrees!,
+        )
+        .toList();
+
+    final double smoothedHeading =
+        headings.isNotEmpty
+            ? _circularMeanHeading(headings)
+            : (rawHeading?.toDouble() ?? double.nan);
+
+    double accelerationKmhPerSec = 0;
+
+    if (history.length >= 2) {
+      final _VehicleTrajectorySample previous =
+          history[history.length - 2];
+      final _VehicleTrajectorySample latest =
+          history.last;
+
+      final double dt = latest.timestamp
+              .difference(previous.timestamp)
+              .inMilliseconds /
+          1000.0;
+
+      if (dt > 0.05 && dt <= 5.0) {
+        accelerationKmhPerSec =
+            (latest.speedKmh - previous.speedKmh) / dt;
+      }
+    }
+
+    double headingConsistency = 180;
+
+    if (headings.length >= 2) {
+      final double meanHeading = smoothedHeading;
+      headingConsistency = headings
+          .map(
+            (double heading) =>
+                _normalizeAngleDifference(
+              heading,
+              meanHeading,
+            ),
+          )
+          .reduce(max);
+    } else if (headings.length == 1) {
+      headingConsistency = 0;
+    }
+
+    final double historySpanSeconds =
+        history.length >= 2
+            ? history.last.timestamp
+                    .difference(history.first.timestamp)
+                    .inMilliseconds /
+                1000.0
+            : 0;
+
+    final double gpsAgeSeconds =
+        _getVehicleGpsAgeSeconds(vehicle);
+
+    final double accuracy =
+        _toDouble(
+      vehicle['gpsAccuracy'] ?? vehicle['accuracy'],
+      fallback: double.infinity,
+    );
+
+    double confidence = 0;
+
+    if (history.length >= 2) {
+      confidence += 25;
+    }
+    if (history.length >= 3) {
+      confidence += 20;
+    }
+    if (historySpanSeconds >= 1.0) {
+      confidence += 15;
+    }
+    if (historySpanSeconds >= 2.5) {
+      confidence += 10;
+    }
+    if (gpsAgeSeconds <= 2.0) {
+      confidence += 15;
+    } else if (gpsAgeSeconds <= 4.0) {
+      confidence += 8;
+    }
+    if (accuracy.isFinite && accuracy <= 10) {
+      confidence += 10;
+    } else if (accuracy.isFinite && accuracy <= 20) {
+      confidence += 5;
+    }
+    if (headingConsistency <= 20) {
+      confidence += 5;
+    } else if (headingConsistency <= 45) {
+      confidence += 2;
+    }
+
+    // Large instantaneous speed changes make a short constant-velocity
+    // trajectory less trustworthy, so confidence is reduced rather than
+    // pretending the path estimate is precise.
+    if (accelerationKmhPerSec.abs() > 6) {
+      confidence -= 8;
+    } else if (accelerationKmhPerSec.abs() > 3) {
+      confidence -= 3;
+    }
+
+    confidence = _clampDouble(
+      confidence,
+      0,
+      100,
+    );
+
+    return <String, double>{
+      'speedKmh': smoothedSpeed,
+      'headingDegrees': smoothedHeading,
+      'accelerationKmhPerSec': accelerationKmhPerSec,
+      'confidence': confidence,
+      'sampleCount': history.length.toDouble(),
+      'historySpanSeconds': historySpanSeconds,
+      'headingConsistencyDegrees': headingConsistency,
+    };
+  }
+
+  String _stabilizeVehicleRisk(
+    String vehicleId,
+    String rawStatus,
+    Map<String, double> prediction,
+  ) {
+    final String normalized = _normalizeStatus(rawStatus);
+
+    if (vehicleId.isEmpty || vehicleId == 'UNKNOWN') {
+      return normalized;
+    }
+
+    // Never delay a physically measured critical event.
+    if (normalized == 'CRITICAL') {
+      _vehicleRiskCandidates[vehicleId] = normalized;
+      _vehicleRiskConfirmations[vehicleId] = 0;
+      return normalized;
+    }
+
+    if (normalized == 'SAFE') {
+      // De-escalation is intentionally immediate. Once the path is no longer
+      // dangerous, keeping an old warning alive would be misleading.
+      _vehicleRiskCandidates.remove(vehicleId);
+      _vehicleRiskConfirmations.remove(vehicleId);
+      return 'SAFE';
+    }
+
+    final String? previousCandidate =
+        _vehicleRiskCandidates[vehicleId];
+
+    if (previousCandidate == normalized) {
+      _vehicleRiskConfirmations[vehicleId] =
+          (_vehicleRiskConfirmations[vehicleId] ?? 0) + 1;
+    } else {
+      _vehicleRiskCandidates[vehicleId] = normalized;
+      _vehicleRiskConfirmations[vehicleId] = 1;
+    }
+
+    final int confirmations =
+        _vehicleRiskConfirmations[vehicleId] ?? 1;
+
+    final double confidence =
+        prediction['confidence'] ?? 0;
+
+    // With weak trajectory confidence, proximity monitoring can still inform
+    // the user, but do not promote a directional prediction aggressively.
+    final bool trajectoryReliable =
+        (prediction['directionReliable'] ?? 0) == 1 &&
+        confidence >= 55;
+
+    if (trajectoryReliable &&
+        confirmations >= _requiredStableRiskConfirmations) {
+      return normalized;
+    }
+
+    // Preserve a very close non-critical physical warning even while the
+    // trajectory history is still warming up.
+    final double distance =
+        prediction['distanceMeters'] ?? double.infinity;
+
+    if (distance <= 15 && normalized == 'HIGH') {
+      return confirmations >= 2 ? 'HIGH' : 'MEDIUM';
+    }
+
+    return 'EARLY';
+  }
+
+  void _pruneTrajectoryState(
+    List<dynamic> currentVehicles,
+  ) {
+    final Set<String> activeIds = <String>{};
+
+    for (final dynamic item in currentVehicles) {
+      if (item is Map) {
+        final String id = _getVehicleId(
+          Map<String, dynamic>.from(item),
+        );
+
+        if (id.isNotEmpty && id != 'UNKNOWN') {
+          activeIds.add(id);
+        }
+      }
+    }
+
+    for (final String id in
+        _vehicleTrajectoryHistory.keys.toList()) {
+      if (!activeIds.contains(id)) {
+        _vehicleTrajectoryHistory.remove(id);
+        _vehicleRiskCandidates.remove(id);
+        _vehicleRiskConfirmations.remove(id);
+      }
+    }
+  }
+
   // =====================================================
   // PRIMARY THREAT HELPERS
   // =====================================================
@@ -785,9 +1654,8 @@ class _V2VHomePageState
       return false;
     }
 
-    // The backend/local distance check is authoritative for the 5 m trigger.
-    // Do not block the one-shot alarm just because phone GPS accuracy is
-    // temporarily poor (especially during indoor/simulation testing).
+    // CRITICAL is already GPS-confidence gated by the risk model. This helper
+    // only controls the one-shot sound/vibration for that confirmed status.
 
     // Unknown IDs are not allowed to bypass the one-shot protection.
     if (vehicleId.isEmpty || vehicleId == 'UNKNOWN') {
@@ -876,48 +1744,29 @@ class _V2VHomePageState
   }
 
   // =====================================================
-  // AUDIO INITIALIZATION
+  // NOTIFICATION AUDIO INITIALIZATION
   // =====================================================
 
-  Future<void>
-      initializeCollisionAudio() {
+  Future<void> initializeCollisionAudio() {
     return _audioInitFuture ??=
         _initializeCollisionAudio();
   }
 
-  Future<void>
-      _initializeCollisionAudio() async {
+  Future<void> _initializeCollisionAudio() async {
     try {
-      final ByteData bytes =
-          await rootBundle.load(
-        kCollisionAudioAsset,
-      );
-
-      if (bytes.lengthInBytes <
-          100) {
-        throw Exception(
-          'Audio file is empty or corrupted.',
-        );
-      }
-
-      await collisionAudioPlayer
-          .setAsset(
-        kCollisionAudioAsset,
-      );
-
-      await collisionAudioPlayer
-          .setVolume(
-        1.0,
-      );
+      await _collisionAudioChannel.invokeMethod<void>('initialize');
 
       collisionAudioReady = true;
+
+      debugPrint(
+        'COLLISION AUDIO READY: native Android notification-volume audio',
+      );
     } catch (e) {
       collisionAudioReady = false;
-
       _audioInitFuture = null;
 
       debugPrint(
-        'AUDIO INIT ERROR: $e',
+        'NATIVE COLLISION AUDIO INIT ERROR: $e',
       );
     }
   }
@@ -926,11 +1775,9 @@ class _V2VHomePageState
   // PLAY WARNING SOUND
   // =====================================================
 
-  Future<void>
-      playCollisionWarning() async {
-    // Hard lock: sound may play only once until the current playback
-    // (or a minimum cooldown) finishes. This prevents rapid re-triggers
-    // from GPS updates + backend collisionWarning arriving together.
+  Future<void> playCollisionWarning() async {
+    // Hard lock: prevent duplicate alert sounds from simultaneous GPS/V2V
+    // collision events.
     if (warningSoundPlaying) {
       return;
     }
@@ -944,33 +1791,19 @@ class _V2VHomePageState
         return;
       }
 
-      await collisionAudioPlayer.stop();
+      await _collisionAudioChannel.invokeMethod<void>('play');
 
-      await collisionAudioPlayer
-          .setVolume(
-        1.0,
-      );
-
-      await collisionAudioPlayer
-          .seek(
-        Duration.zero,
-      );
-
-      await collisionAudioPlayer
-          .play();
-
-      // Keep the lock until the sound has had time to finish.
-      // Most short warning clips are 1–3 seconds; we hold 4 s minimum.
+      // Keep the lock briefly so the same danger episode cannot retrigger
+      // the sound repeatedly on consecutive GPS/backend updates.
       await Future<void>.delayed(
         const Duration(seconds: 4),
       );
     } catch (e) {
       debugPrint(
-        'WARNING SOUND ERROR: $e',
+        'NATIVE COLLISION AUDIO PLAY ERROR: $e',
       );
     } finally {
-      warningSoundPlaying =
-          false;
+      warningSoundPlaying = false;
     }
   }
 
@@ -1086,7 +1919,7 @@ class _V2VHomePageState
       );
 
       _showSnackBar(
-        'Warning sound and vibration tested.',
+        'Collision sound and vibration tested.',
         Colors.green,
       );
     } catch (e) {
@@ -1325,6 +2158,7 @@ class _V2VHomePageState
 
     _configureV2VCallbacks();
     _startFirestoreVehicleListener();
+    _startLiveMapPruner();
 
     WidgetsBinding.instance
         .addPostFrameCallback(
@@ -1347,12 +2181,16 @@ class _V2VHomePageState
   void dispose() {
     _gpsPollingTimer?.cancel();
     _v2vSyncTimer?.cancel();
+    _liveMapPruneTimer?.cancel();
     gpsSubscription?.cancel();
     _firestoreVehicleSubscription?.cancel();
 
+    _vehicleTrajectoryHistory.clear();
+    _vehicleRiskCandidates.clear();
+    _vehicleRiskConfirmations.clear();
+
     v2vService.disconnect();
 
-    collisionAudioPlayer.dispose();
 
     super.dispose();
   }
@@ -1479,6 +2317,114 @@ class _V2VHomePageState
   /// map synchronized in real time. Firestore is used only for map data;
   /// the existing Socket.IO V2V callbacks continue to handle nearby-vehicle
   /// safety and collision warnings.
+  // Keep the live map consistent with the Nearby Vehicles safety view.
+  // A vehicle is considered live for the map only when its GPS fix is no
+  // older than 4 seconds and it is within the 100 m display radius.
+  // A periodic prune is required because time passing alone does not create
+  // a new Firestore snapshot.
+  void _startLiveMapPruner() {
+    _liveMapPruneTimer?.cancel();
+
+    _liveMapPruneTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _pruneLiveMapVehicles(),
+    );
+  }
+
+  void _pruneLiveMapVehicles() {
+    if (!mounted || liveMapVehicles.isEmpty) {
+      return;
+    }
+
+    final List<dynamic> filtered = liveMapVehicles.where((dynamic item) {
+      if (item is! Map) {
+        return false;
+      }
+
+      return _isLiveMapVehicle(
+        Map<String, dynamic>.from(item),
+      );
+    }).toList();
+
+    if (filtered.length == liveMapVehicles.length) {
+      return;
+    }
+
+    setState(() {
+      liveMapVehicles = filtered;
+    });
+  }
+
+  double _getLiveMapAgeSeconds(Map<String, dynamic> vehicle) {
+    final dynamic receivedAtValue = vehicle['_mapReceivedAtMs'];
+
+    if (receivedAtValue is num) {
+      final double age =
+          DateTime.now().millisecondsSinceEpoch / 1000 -
+              receivedAtValue.toDouble() / 1000;
+
+      if (age.isFinite) {
+        return age < 0 ? 0 : age;
+      }
+    }
+
+    // Firestore/server data normally contains the device GPS timestamp.
+    final double gpsAge = _getVehicleGpsAgeSeconds(vehicle);
+    if (gpsAge.isFinite) {
+      return gpsAge;
+    }
+
+    // Firestore also stores a server-side updatedAt. This avoids rejecting a
+    // genuinely fresh document when the two phones have slightly different
+    // device clocks or when gpsTimestamp is missing.
+    final dynamic updatedAt = vehicle['updatedAt'];
+
+    if (updatedAt is Timestamp) {
+      final double age =
+          DateTime.now().difference(updatedAt.toDate()).inMilliseconds /
+              1000.0;
+
+      return age < 0 ? 0 : age;
+    }
+
+    if (updatedAt is num) {
+      final double age =
+          DateTime.now().millisecondsSinceEpoch / 1000 -
+              updatedAt.toDouble() / 1000;
+
+      if (age.isFinite) {
+        return age < 0 ? 0 : age;
+      }
+    }
+
+    return double.infinity;
+  }
+
+  bool _isLiveMapVehicle(Map<String, dynamic> vehicle) {
+    final String id = _getVehicleId(vehicle);
+
+    if (id.isEmpty || id == vehicleId) {
+      return false;
+    }
+
+    final double? lat = _getVehicleLatitude(vehicle);
+    final double? lng = _getVehicleLongitude(vehicle);
+
+    if (lat == null || lng == null || !_hasValidCoordinates(lat, lng)) {
+      return false;
+    }
+
+    // A Socket.IO vehiclePosition event is itself proof that the backend has
+    // just sent a live position. Firestore documents use GPS/server timestamps.
+    // This prevents the map from rejecting valid Socket.IO positions simply
+    // because the backend position payload does not contain gpsTimestamp.
+    if (_getLiveMapAgeSeconds(vehicle) > 4.0) {
+      return false;
+    }
+
+    return _isWithinDisplayRadius(vehicle);
+  }
+
   void _startFirestoreVehicleListener() {
     _firestoreVehicleSubscription?.cancel();
 
@@ -1519,6 +2465,12 @@ class _V2VHomePageState
             continue;
           }
 
+          // Live map = nearby + fresh GPS only. Historical Firestore
+          // documents and distant vehicles are intentionally excluded.
+          if (!_isLiveMapVehicle(vehicle)) {
+            continue;
+          }
+
           cleanedVehicles.add(vehicle);
         }
 
@@ -1527,8 +2479,14 @@ class _V2VHomePageState
         }
 
         setState(() {
-          liveMapVehicles = cleanedVehicles;
-          _firestoreLiveMapActive = true;
+          if (cleanedVehicles.isNotEmpty) {
+            liveMapVehicles = cleanedVehicles;
+          }
+
+          // Only claim Firestore is the active map source when it actually
+          // delivered at least one live remote vehicle. An empty snapshot must
+          // not suppress the working Socket.IO position stream.
+          _firestoreLiveMapActive = cleanedVehicles.isNotEmpty;
         });
       },
       onError: (Object error) {
@@ -2239,10 +3197,14 @@ class _V2VHomePageState
         continue;
       }
 
+      _recordVehicleTrajectory(vehicle);
+
       cleanedVehicles.add(
         vehicle,
       );
     }
+
+    _pruneTrajectoryState(cleanedVehicles);
 
     if (!mounted) {
       return;
@@ -2282,7 +3244,9 @@ class _V2VHomePageState
       }
 
       final Map<String, dynamic> vehicle =
-          Map<String, dynamic>.from(item);
+          Map<String, dynamic>.from(item)
+            ..['_mapReceivedAtMs'] =
+                DateTime.now().millisecondsSinceEpoch;
 
       final String id = _getVehicleId(vehicle);
 
@@ -2298,6 +3262,10 @@ class _V2VHomePageState
         continue;
       }
 
+      if (!_isLiveMapVehicle(vehicle)) {
+        continue;
+      }
+
       cleanedVehicles.add(vehicle);
     }
 
@@ -2305,15 +3273,17 @@ class _V2VHomePageState
       return;
     }
 
-    // Firestore is the preferred real-time source for the live map. Keep the
-    // Socket.IO snapshot as a fallback only until the Firestore listener has
-    // successfully delivered data.
-    if (_firestoreLiveMapActive) {
+    // Socket.IO position snapshots are already produced by the live V2V
+    // backend, so they are safe to use as a real-time map source. Firestore
+    // remains useful for persistence/recovery and can also refresh the list.
+    if (cleanedVehicles.isEmpty && _firestoreLiveMapActive) {
       return;
     }
 
     setState(() {
-      liveMapVehicles = cleanedVehicles;
+      if (cleanedVehicles.isNotEmpty) {
+        liveMapVehicles = cleanedVehicles;
+      }
     });
   }
 
@@ -2333,6 +3303,13 @@ class _V2VHomePageState
         incomingId == vehicleId) {
       return;
     }
+
+    final Map<String, dynamic> mapData =
+        Map<String, dynamic>.from(data)
+          ..['_mapReceivedAtMs'] =
+              DateTime.now().millisecondsSinceEpoch;
+
+    _recordVehicleTrajectory(data);
 
     // Remove vehicles that have moved outside the 100 m radius.
     if (!_isWithinDisplayRadius(data)) {
@@ -2354,8 +3331,20 @@ class _V2VHomePageState
 
       _rearmCriticalAlertsFromNearbyVehicles(filtered);
 
+      final List<dynamic> filteredMap = liveMapVehicles.where((dynamic item) {
+        if (item is! Map) {
+          return false;
+        }
+
+        return _getVehicleId(
+              Map<String, dynamic>.from(item),
+            ) !=
+            incomingId;
+      }).toList();
+
       setState(() {
         nearbyVehicles = filtered;
+        liveMapVehicles = filteredMap;
       });
 
       _evaluateNearbyThreats();
@@ -2424,10 +3413,14 @@ class _V2VHomePageState
       },
     );
 
-    if (mapIndex >= 0) {
-      updatedMap[mapIndex] = data;
-    } else {
-      updatedMap.add(data);
+    if (_isLiveMapVehicle(mapData)) {
+      if (mapIndex >= 0) {
+        updatedMap[mapIndex] = mapData;
+      } else {
+        updatedMap.add(mapData);
+      }
+    } else if (mapIndex >= 0) {
+      updatedMap.removeAt(mapIndex);
     }
 
     setState(() {
@@ -2450,6 +3443,10 @@ class _V2VHomePageState
     if (removedVehicleId.isEmpty) {
       return;
     }
+
+    _vehicleTrajectoryHistory.remove(removedVehicleId);
+    _vehicleRiskCandidates.remove(removedVehicleId);
+    _vehicleRiskConfirmations.remove(removedVehicleId);
 
     _rearmCriticalAlertForVehicle(removedVehicleId);
     _shownVisualWarningKeys.removeWhere(
@@ -3055,61 +4052,147 @@ class _V2VHomePageState
   // LOCAL RISK CALCULATION
   // =====================================================
 
-  String _calculateLocalRiskStatus(
+  String _calculateLocalRiskStatusRaw(
     Map<String, dynamic> vehicle,
     double distance,
   ) {
-    if (!distance.isFinite ||
-        distance == double.infinity) {
+    if (!distance.isFinite || distance == double.infinity) {
       return 'SAFE';
     }
 
-    final double otherSpeed =
-        _getVehicleSpeed(
-      vehicle,
-    );
+    final double otherSpeed = _getVehicleSpeed(vehicle);
+    final bool otherBraking = vehicle['braking'] == true;
+    final Map<String, double> prediction =
+        _calculateCollisionPrediction(vehicle, distance);
 
-    final bool otherBraking =
-        vehicle['braking'] == true;
+    final bool directionReliable =
+        (prediction['directionReliable'] ?? 0) == 1;
+    final bool remoteFresh =
+        (prediction['remoteFresh'] ?? 0) == 1;
+    final bool collisionPath =
+        (prediction['collisionPath'] ?? 0) == 1;
+    final bool approaching =
+        (prediction['approaching'] ?? 0) == 1;
+    final double ttc = prediction['ttcSeconds'] ?? double.infinity;
+    final double missDistance =
+        prediction['predictedMissDistanceMeters'] ?? double.infinity;
+    final double lateral = prediction['lateralMeters'] ?? double.infinity;
+    final double longitudinal =
+        prediction['longitudinalMeters'] ?? 0;
+    final double headingDifference =
+        prediction['headingDifferenceDegrees'] ?? double.nan;
 
-    // -----------------------------------------------------
-    // Distance-based safety thresholds
-    // -----------------------------------------------------
-    // The emergency sound rule is exact: 5 m or less is CRITICAL.
-    // GPS accuracy must not silently downgrade the alert and prevent the
-    // one-time warning from playing.
-    // -----------------------------------------------------
-    if (distance <= _criticalDistanceMeters) {
+    // A stale remote position must never escalate a prediction. The physical
+    // 5 m rule is retained only for a fresh, accurate observation.
+    final double combinedUncertainty =
+        prediction['combinedUncertaintyMeters'] ?? double.infinity;
+    final double gpsConfidence = prediction['gpsConfidence'] ?? 0;
+    final double remoteAccuracy =
+        prediction['remoteAccuracyMeters'] ?? double.infinity;
+
+    // Do not call a 5 m measurement a high-confidence emergency when the two
+    // phones themselves report large position uncertainty.
+    final bool criticalGpsReliable =
+        remoteFresh &&
+        gpsAccuracyMeters <= 10.0 &&
+        remoteAccuracy <= 10.0 &&
+        combinedUncertainty <= 14.2 &&
+        gpsConfidence >= 65;
+
+    if (distance <= _criticalDistanceMeters && criticalGpsReliable) {
       return 'CRITICAL';
     }
 
-    if (distance <= 20.0) {
+    // Extremely close but uncertain: keep a strong warning without claiming
+    // that the exact 5 m position is trustworthy enough for an emergency alarm.
+    if (distance <= _criticalDistanceMeters && remoteFresh) {
       return 'HIGH';
     }
 
-    if (distance <= 50.0) {
-      return 'MEDIUM';
+    if (directionReliable && remoteFresh) {
+      // Crossing/head-on/overtaking are all accepted only when the predicted
+      // trajectories actually converge to a small miss distance.
+      if (collisionPath && ttc.isFinite) {
+        if (ttc <= 1.5 && gpsConfidence >= 65) return 'CRITICAL';
+        if (ttc <= 3.0) return 'HIGH';
+        if (ttc <= 5.0) return 'MEDIUM';
+        if (ttc <= 8.0) return 'EARLY';
+      }
+
+      // Same-direction following/overtaking needs both longitudinal closing
+      // and small lateral offset. This prevents a nearby parallel vehicle from
+      // being labelled a collision threat.
+      final bool sameDirection =
+          headingDifference.isFinite && headingDifference <= 30.0;
+      final bool sameLaneLike =
+          sameDirection && lateral <= 6.0;
+      final bool closingFromBehind =
+          longitudinal < -2.0 &&
+          (prediction['closingSpeedMps'] ?? 0) > 0.5;
+
+      if (sameLaneLike && closingFromBehind && ttc.isFinite) {
+        if (ttc <= 1.5 && gpsConfidence >= 65) return 'CRITICAL';
+        if (ttc <= 3.0) return 'HIGH';
+        if (ttc <= 5.0) return 'MEDIUM';
+        if (ttc <= 8.0) return 'EARLY';
+      }
+
+      // If trajectories are clearly separating, do not warn just because the
+      // vehicles are within the old distance bands.
+      if (!approaching ||
+          missDistance > 8.0 ||
+          (sameDirection && lateral > 6.0)) {
+        return 'SAFE';
+      }
     }
 
-    if (distance <= 100.0) {
+    // Direction can be unreliable at low speed or when a phone cannot obtain a
+    // heading. In that case, retain conservative proximity monitoring, but do
+    // not invent a collision prediction from distance alone.
+    if (!directionReliable || !remoteFresh) {
+      if (distance <= 15.0) return 'HIGH';
+      if (distance <= 40.0) return 'MEDIUM';
+      if (distance <= 100.0) return 'EARLY';
+    }
+
+    // Keep the existing high-speed early-awareness feature, but never turn it
+    // into a collision warning by itself.
+    if (speed >= 40 && otherSpeed >= 40 && distance <= 150) {
       return 'EARLY';
     }
 
-    // A faster approaching vehicle can receive an earlier
-    // warning even when it is slightly farther away.
-    if (speed >= 40 &&
-        otherSpeed >= 40 &&
-        distance <= 150) {
-      return 'EARLY';
-    }
-
-    if (braking &&
-        otherBraking &&
-        distance <= 80) {
+    // Both vehicles braking in close proximity remains a caution signal.
+    if (braking && otherBraking && distance <= 60) {
       return 'MEDIUM';
     }
 
     return 'SAFE';
+  }
+
+  String _calculateLocalRiskStatus(
+    Map<String, dynamic> vehicle,
+    double distance,
+  ) {
+    final String rawStatus =
+        _calculateLocalRiskStatusRaw(
+      vehicle,
+      distance,
+    );
+
+    final String vehicleId =
+        _getVehicleId(vehicle);
+
+    final Map<String, double> prediction =
+        _calculateCollisionPrediction(
+      vehicle,
+      distance,
+    );
+
+    return _stabilizeVehicleRisk(
+      vehicleId,
+      rawStatus,
+      prediction,
+    );
   }
 
   // =====================================================
@@ -3122,9 +4205,7 @@ class _V2VHomePageState
     double distance,
   ) {
     final String id =
-        _getVehicleId(
-      vehicle,
-    );
+        _getVehicleId(vehicle);
 
     final String name =
         id.isEmpty
@@ -3136,36 +4217,66 @@ class _V2VHomePageState
             ? '${distance.toStringAsFixed(1)} m'
             : 'unknown distance';
 
+    final Map<String, double> prediction =
+        _calculateCollisionPrediction(
+      vehicle,
+      distance,
+    );
+
+    final bool approaching =
+        (prediction['approaching'] ?? 0) == 1;
+
+    final double closingSpeed =
+        prediction['closingSpeedKmh'] ?? 0;
+
+    final double ttc =
+        prediction['ttcSeconds'] ??
+            double.infinity;
+
+    final bool directionReliable =
+        (prediction['directionReliable'] ?? 0) == 1;
+    final double gpsConfidence = prediction['gpsConfidence'] ?? 0;
+    final double combinedUncertainty =
+        prediction['combinedUncertaintyMeters'] ?? double.infinity;
+
+    final String predictionText =
+        directionReliable && approaching && ttc.isFinite
+            ? ' TTC ${_formatTtc(ttc)}, '
+                'closing ${closingSpeed.toStringAsFixed(0)} km/h.'
+            : (gpsConfidence < 65 && combinedUncertainty.isFinite
+                ? ' GPS confidence ${gpsConfidence.toStringAsFixed(0)}%, '
+                    'uncertainty ±${combinedUncertainty.toStringAsFixed(0)} m.'
+                : '');
+
     switch (
-      _normalizeStatus(
-        status,
-      )
+      _normalizeStatus(status)
     ) {
       case 'CRITICAL':
         return 'CRITICAL COLLISION WARNING! '
-            '$name is only $distanceText away. '
-            'Take immediate action.';
+            '$name is $distanceText away.'
+            '$predictionText Take immediate action.';
 
       case 'HIGH':
         return 'HIGH COLLISION RISK! '
-            '$name is $distanceText away. '
-            'Slow down and be prepared to brake.';
+            '$name is $distanceText away.'
+            '$predictionText Slow down and be prepared to brake.';
 
       case 'MEDIUM':
         return 'CAUTION: $name is '
-            '$distanceText away. '
-            'Monitor the surrounding traffic.';
+            '$distanceText away.'
+            '$predictionText Monitor the surrounding traffic.';
 
       case 'EARLY':
         return '$name detected at '
-            '$distanceText. '
-            'Vehicle is being monitored.';
+            '$distanceText.'
+            '$predictionText Vehicle is being monitored.';
 
       case 'SAFE':
       default:
         return 'No immediate collision risk.';
     }
   }
+
 
   // =====================================================
   // SAFE STATUS HANDLING
@@ -3276,6 +4387,57 @@ class _V2VHomePageState
     );
 
     await checkBackendConnection();
+  }
+
+  // =====================================================
+  // FULL V2V + GPS REFRESH
+  // =====================================================
+
+  Future<void> refreshAll() async {
+    if (_fullRefreshInProgress || !mounted) {
+      return;
+    }
+
+    _fullRefreshInProgress = true;
+
+    try {
+      setState(() {
+        backendStatusMessage =
+            'Refreshing V2V backend and GPS...';
+      });
+
+      // First refresh the Socket.IO connection. This performs a backend
+      // health check and reconnects the vehicle when the backend is available.
+      await refreshConnection();
+
+      if (!mounted) {
+        return;
+      }
+
+      // Then restart GPS tracking so the next position is a fresh hardware
+      // fix and is immediately published to the V2V backend/Firestore.
+      await refreshGps();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        backendStatusMessage =
+            v2vService.isConnected && gpsConnected
+                ? 'V2V backend and GPS refreshed'
+                : 'Refresh completed with connection pending';
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          backendStatusMessage =
+              'Refresh failed: $e';
+        });
+      }
+    } finally {
+      _fullRefreshInProgress = false;
+    }
   }
 
   // =====================================================
@@ -3900,27 +5062,6 @@ class _V2VHomePageState
               ),
             ],
           ),
-          actions: [
-            IconButton(
-              tooltip: 'Refresh connection',
-              onPressed:
-                  backendChecking ? null : refreshConnection,
-              icon: backendChecking
-                  ? const SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                      ),
-                    )
-                  : const Icon(Icons.refresh),
-            ),
-            IconButton(
-              tooltip: 'Test warning',
-              onPressed: testWarningSound,
-              icon: const Icon(Icons.volume_up),
-            ),
-          ],
           bottom: const TabBar(
             // Keep all sections fixed on screen. This removes the empty
             // leading space and horizontal sliding of the tab bar.
@@ -3961,7 +5102,7 @@ class _V2VHomePageState
           child: SafeArea(
             top: false,
             child: RefreshIndicator(
-              onRefresh: refreshConnection,
+              onRefresh: refreshAll,
               child: TabBarView(
                 // Change sections only by tapping the tabs; disable
                 // horizontal swipe/slide between pages.
@@ -3971,11 +5112,43 @@ class _V2VHomePageState
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.all(16),
                     children: [
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed:
+                              _fullRefreshInProgress
+                                  ? null
+                                  : refreshAll,
+                          icon:
+                              _fullRefreshInProgress
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(
+                                      Icons.refresh_rounded,
+                                    ),
+                          label: Text(
+                            _fullRefreshInProgress
+                                ? 'REFRESHING V2V + GPS...'
+                                : 'REFRESH V2V + GPS',
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(
+                              vertical: 15,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
                       _buildConnectionStatusCard(),
                       const SizedBox(height: 14),
                       _buildGpsStatusCard(),
                       const SizedBox(height: 14),
-                      _buildSafetyStatusCard(normalizedStatus),
+                      _buildTrafficCard(),
                       const SizedBox(height: 30),
                     ],
                   ),
@@ -3991,7 +5164,7 @@ class _V2VHomePageState
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.all(16),
                     children: [
-                      _buildTrafficCard(),
+                      _buildSafetyStatusCard(normalizedStatus),
                       const SizedBox(height: 14),
                       _buildNearbyVehiclesCard(),
                       const SizedBox(height: 14),
@@ -4543,78 +5716,179 @@ class _V2VHomePageState
         warningVehicle!;
 
     final String id =
-        _getVehicleId(
-      vehicle,
-    );
+        _getVehicleId(vehicle);
 
     final String type =
-        _getVehicleType(
-      vehicle,
-    );
+        _getVehicleType(vehicle);
 
     final double distance =
-        _distanceFromVehicle(
+        _distanceFromVehicle(vehicle);
+
+    final Map<String, double> prediction =
+        _calculateCollisionPrediction(
       vehicle,
+      distance,
     );
+
+    final double closingSpeed =
+        prediction['closingSpeedKmh'] ?? 0;
+
+    final double ttc =
+        prediction['ttcSeconds'] ??
+            double.infinity;
+
+    final bool approaching =
+        (prediction['approaching'] ?? 0) == 1;
+
+    final bool directionReliable =
+        (prediction['directionReliable'] ?? 0) == 1;
 
     return Container(
       width: double.infinity,
       padding:
-          const EdgeInsets.all(
-        12,
-      ),
+          const EdgeInsets.all(12),
       decoration:
           BoxDecoration(
         color: Colors.white,
         borderRadius:
-            BorderRadius.circular(
-          12,
-        ),
+            BorderRadius.circular(12),
       ),
-      child: Row(
+      child: Column(
         children: [
-          const Icon(
-            Icons
-                .directions_car_filled_rounded,
-          ),
-          const SizedBox(
-            width: 10,
-          ),
-          Expanded(
-            child: Column(
-              crossAxisAlignment:
-                  CrossAxisAlignment.start,
-              children: [
+          Row(
+            children: [
+              const Icon(
+                Icons
+                    .directions_car_filled_rounded,
+              ),
+              const SizedBox(
+                width: 10,
+              ),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment:
+                      CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      id.isEmpty
+                          ? 'Nearby Vehicle'
+                          : id,
+                      style:
+                          const TextStyle(
+                        fontWeight:
+                            FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      type,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color:
+                            Colors.grey.shade700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (distance.isFinite)
                 Text(
-                  id.isEmpty
-                      ? 'Nearby Vehicle'
-                      : id,
+                  '${distance.toStringAsFixed(1)} m',
                   style:
                       const TextStyle(
                     fontWeight:
                         FontWeight.bold,
                   ),
                 ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: _buildThreatMetric(
+                  icon: Icons.speed_rounded,
+                  label: 'Closing Speed',
+                  value: directionReliable && approaching
+                      ? '${closingSpeed.toStringAsFixed(0)} km/h'
+                      : 'Not approaching',
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _buildThreatMetric(
+                  icon: Icons.timer_outlined,
+                  label: 'Time to Collision',
+                  value: directionReliable && approaching
+                      ? _formatTtc(ttc)
+                      : '--',
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildThreatMetric({
+    required IconData icon,
+    required String label,
+    required String value,
+  }) {
+    return Container(
+      padding:
+          const EdgeInsets.symmetric(
+        horizontal: 9,
+        vertical: 8,
+      ),
+      decoration: BoxDecoration(
+        color:
+            Colors.blueGrey.withValues(
+          alpha: 0.06,
+        ),
+        borderRadius:
+            BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            icon,
+            size: 18,
+            color: Colors.blueGrey,
+          ),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Column(
+              crossAxisAlignment:
+                  CrossAxisAlignment.start,
+              children: [
                 Text(
-                  type,
+                  label,
+                  maxLines: 1,
+                  overflow:
+                      TextOverflow.ellipsis,
                   style: TextStyle(
-                    fontSize: 12,
+                    fontSize: 9,
                     color:
                         Colors.grey.shade700,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  maxLines: 1,
+                  overflow:
+                      TextOverflow.ellipsis,
+                  style:
+                      const TextStyle(
+                    fontSize: 12,
+                    fontWeight:
+                        FontWeight.w800,
                   ),
                 ),
               ],
             ),
           ),
-          if (distance.isFinite)
-            Text(
-              '${distance.toStringAsFixed(1)} m',
-              style:
-                  const TextStyle(
-                fontWeight:
-                    FontWeight.bold,
-              ),
-            ),
         ],
       ),
     );
@@ -4673,7 +5947,7 @@ class _V2VHomePageState
                 ),
                 const Spacer(),
                 Text(
-                  '${liveMapVehicles.length} active',
+                  '${liveMapVehicles.length} nearby active',
                   style: TextStyle(
                     fontSize: 12,
                     color:
@@ -5652,6 +6926,89 @@ class _V2VHomePageState
                   ),
                 ),
 
+                const SizedBox(height: 3),
+
+                Builder(
+                  builder: (BuildContext context) {
+                    final Map<String, double> prediction =
+                        _calculateCollisionPrediction(
+                      vehicle,
+                      distance,
+                    );
+
+                    final bool approaching =
+                        (prediction['approaching'] ?? 0) == 1;
+
+                    final bool directionReliable =
+                        (prediction['directionReliable'] ?? 0) == 1;
+
+                    final double closingSpeed =
+                        prediction['closingSpeedKmh'] ?? 0;
+
+                    final double ttc =
+                        prediction['ttcSeconds'] ??
+                            double.infinity;
+
+                    final double confidence =
+                        prediction['confidence'] ?? 0;
+
+                    final double gpsAge =
+                        prediction['gpsAgeSeconds'] ?? -1;
+
+                    final String predictionLabel =
+                        gpsAge > 4
+                            ? 'GPS update stale • prediction paused'
+                            : directionReliable && approaching && ttc.isFinite
+                                ? 'Closing ${closingSpeed.toStringAsFixed(0)} km/h • TTC ${_formatTtc(ttc)}'
+                                : directionReliable
+                                    ? 'Direction checked • Not closing'
+                                    : 'Waiting for reliable direction';
+
+                    final double acceleration =
+                        prediction['accelerationKmhPerSec'] ?? 0;
+
+                    final String accelerationLabel =
+                        acceleration.abs() >= 0.5
+                            ? ' • ${acceleration >= 0 ? '+' : ''}${acceleration.toStringAsFixed(1)} km/h/s'
+                            : '';
+
+                    final String confidenceLabel =
+                        'Prediction confidence ${confidence.toStringAsFixed(0)}%$accelerationLabel';
+
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          predictionLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: approaching
+                                ? color
+                                : Colors.grey.shade600,
+                            fontWeight:
+                                approaching
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          confidenceLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 9,
+                            color: Colors.grey.shade500,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+
                 const SizedBox(height: 8),
 
                 Container(
@@ -5845,20 +7202,6 @@ class _V2VHomePageState
                 ),
                 label: const Text(
                   'TEST COLLISION ALERT',
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 12),
-
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: refreshGps,
-                icon: const Icon(Icons.my_location_rounded),
-                label: const Text('REFRESH GPS'),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 15),
                 ),
               ),
             ),

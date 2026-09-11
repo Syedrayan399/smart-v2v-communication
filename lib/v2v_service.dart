@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:developer' as developer;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:http/http.dart' as http;
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 
@@ -13,7 +14,7 @@ import 'package:socket_io_client/socket_io_client.dart' as IO;
 /// - Internet / ngrok HTTPS backend
 /// - Automatic Socket.IO reconnection
 /// - Vehicle re-registration after reconnect
-/// - Optional shared-secret authentication
+/// - Firebase ID-token authentication
 /// - Nearby vehicle events
 /// - Collision warning events
 /// - Vehicle position events
@@ -43,6 +44,7 @@ class V2VService {
 
   bool _disposed = false;
   bool _isConnecting = false;
+  Timer? _authRefreshTimer;
 
   V2VService() {
     _baseUrl = _resolveBaseUrl();
@@ -89,16 +91,65 @@ class V2VService {
   }
 
   // ============================================================
-  // AUTHENTICATION
+  // FIREBASE AUTHENTICATION
   // ============================================================
 
-  String get _authToken {
-    const token = String.fromEnvironment(
-      'V2V_SHARED_SECRET',
-      defaultValue: '',
-    );
+  Future<String> _getFirebaseIdToken() async {
+    final user = FirebaseAuth.instance.currentUser;
 
-    return token.trim();
+    if (user == null) {
+      throw StateError(
+        'Firebase user is not authenticated.',
+      );
+    }
+
+    final token = await user.getIdToken();
+
+    if (token == null || token.trim().isEmpty) {
+      throw StateError(
+        'Firebase ID token could not be obtained.',
+      );
+    }
+
+    return token;
+  }
+
+  Future<void> _refreshSocketAuthToken() async {
+    final socket = _socket;
+
+    if (socket == null ||
+        !socket.connected ||
+        _disposed) {
+      return;
+    }
+
+    try {
+      final token = await _getFirebaseIdToken();
+
+      socket.emit(
+        'refreshAuth',
+        {
+          'token': token,
+        },
+      );
+
+      print('🔐 Firebase authentication token refreshed.');
+    } catch (error) {
+      print('⚠️ Firebase token refresh failed: $error');
+    }
+  }
+
+  void _startAuthRefreshTimer() {
+    _authRefreshTimer?.cancel();
+
+    // Firebase ID tokens are short-lived. Refresh the server-side
+    // Socket.IO authentication before the normal token lifetime ends.
+    _authRefreshTimer = Timer.periodic(
+      const Duration(minutes: 45),
+      (_) {
+        _refreshSocketAuthToken();
+      },
+    );
   }
 
   // ============================================================
@@ -166,7 +217,7 @@ class V2VService {
   // CONNECT
   // ============================================================
 
-  void connect({
+  Future<void> connect({
     required String vehicleId,
     required String vehicleName,
     required String vehicleType,
@@ -175,7 +226,7 @@ class V2VService {
     required double longitude,
     required double gpsAccuracy,
     required int gpsTimestamp,
-  }) {
+  }) async {
     _disposed = false;
 
     _vehicleId = vehicleId;
@@ -186,6 +237,8 @@ class V2VService {
     _longitude = longitude;
     _gpsAccuracy = gpsAccuracy;
     _gpsTimestamp = gpsTimestamp;
+
+    final firebaseIdToken = await _getFirebaseIdToken();
 
     // Save the initial/latest GPS position to Firestore without
     // affecting the existing Socket.IO V2V connection flow.
@@ -239,8 +292,6 @@ class V2VService {
 
     _disposeCurrentSocket();
 
-    final hasToken = _authToken.isNotEmpty;
-
     final builder = IO.OptionBuilder()
         .setTransports([
           'websocket',
@@ -254,19 +305,11 @@ class V2VService {
         .setReconnectionDelayMax(5000)
         .setTimeout(15000);
 
-    if (hasToken) {
-      builder.setQuery({
-        'token': _authToken,
-      });
+    builder.setAuth({
+      'token': firebaseIdToken,
+    });
 
-      builder.setAuth({
-        'token': _authToken,
-      });
-
-      print('🔐 V2V shared secret configured.');
-    } else {
-      print('🔓 No V2V shared secret configured.');
-    }
+    print('🔐 Firebase ID token configured for V2V connection.');
 
     final socket = IO.io(
       _baseUrl,
@@ -300,6 +343,7 @@ class V2VService {
       // Always register again after a successful connection
       // or reconnection.
       _registerCurrentVehicle();
+      _startAuthRefreshTimer();
 
       onConnected?.call();
     });
@@ -752,6 +796,16 @@ class V2VService {
         ? _gpsTimestamp
         : DateTime.now().millisecondsSinceEpoch;
 
+    final ownerUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+
+    if (ownerUid.isEmpty) {
+      developer.log(
+        'Skipping Firestore vehicle write because Firebase user is not authenticated.',
+        name: 'V2VService',
+      );
+      return;
+    }
+
     try {
       await _firestore
           .collection('vehicles')
@@ -759,6 +813,7 @@ class V2VService {
           .set(
         {
           'vehicleId': vehicleId,
+          'ownerUid': ownerUid,
           'name': _vehicleName ?? vehicleId,
           'vehicleName': _vehicleName ?? vehicleId,
           'type': _vehicleType ?? 'Vehicle',
@@ -835,27 +890,19 @@ class V2VService {
   // HTTP AUTH HEADERS
   // ============================================================
 
-  Map<String, String> _authHeaders({
+  Future<Map<String, String>> _authHeaders({
     Map<String, String>? additionalHeaders,
-  }) {
-    final headers =
-        <String, String>{};
+  }) async {
+    final headers = <String, String>{};
 
     if (additionalHeaders != null) {
-      headers.addAll(
-        additionalHeaders,
-      );
+      headers.addAll(additionalHeaders);
     }
 
-    final token = _authToken;
+    final token = await _getFirebaseIdToken();
 
-    if (token.isNotEmpty) {
-      headers['x-v2v-token'] =
-          token;
-
-      headers['Authorization'] =
-          'Bearer $token';
-    }
+    headers['Authorization'] =
+        'Bearer $token';
 
     return headers;
   }
@@ -1017,13 +1064,13 @@ class V2VService {
   Future<http.Response> _get(
     String path, {
     required Duration timeout,
-  }) {
+  }) async {
     return http
         .get(
           Uri.parse(
             '$_baseUrl$path',
           ),
-          headers: _authHeaders(),
+          headers: await _authHeaders(),
         )
         .timeout(timeout);
   }
@@ -1037,13 +1084,13 @@ class V2VService {
     Map<String, String>? headers,
     Object? body,
     required Duration timeout,
-  }) {
+  }) async {
     return http
         .post(
           Uri.parse(
             '$_baseUrl$path',
           ),
-          headers: _authHeaders(
+          headers: await _authHeaders(
             additionalHeaders: headers,
           ),
           body: body,
@@ -1058,13 +1105,13 @@ class V2VService {
   Future<http.Response> _delete(
     String path, {
     required Duration timeout,
-  }) {
+  }) async {
     return http
         .delete(
           Uri.parse(
             '$_baseUrl$path',
           ),
-          headers: _authHeaders(),
+          headers: await _authHeaders(),
         )
         .timeout(timeout);
   }
@@ -1121,6 +1168,8 @@ class V2VService {
 
   void disconnect() {
     _isConnecting = false;
+    _authRefreshTimer?.cancel();
+    _authRefreshTimer = null;
     _disposeCurrentSocket();
   }
 
