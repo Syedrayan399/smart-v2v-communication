@@ -49,7 +49,6 @@ initializeApp({
 
 const firebaseAuth = getAuth();
 
-
 const DETECTION_RADIUS_METERS = 200;
 
 // =====================================================
@@ -408,46 +407,479 @@ function calculateCollisionRisk(
       nearbyVehicle.speed
     );
 
-  const speedDifference =
-    Math.abs(
-      nearbySpeed -
-        ownSpeed
+  const ownDirection =
+    numberValue(
+      ownVehicle.direction
+    );
+
+  const nearbyDirection =
+    numberValue(
+      nearbyVehicle.direction
+    );
+
+  const ownAccuracy =
+    numberValue(
+      ownVehicle.gpsAccuracy,
+      10
+    );
+
+  const nearbyAccuracy =
+    numberValue(
+      nearbyVehicle.gpsAccuracy,
+      10
     );
 
   const nearbyBraking =
     nearbyVehicle.braking ===
     true;
 
-  let risk = "SAFE";
+  // -----------------------------------------------------
+  // GPS / MOVEMENT RELIABILITY
+  // -----------------------------------------------------
 
-  if (
-    distance <= 5 &&
-    nearbySpeed >= 3
-  ) {
-    risk = "CRITICAL";
-  } else if (
-    distance <= 15 &&
-    nearbySpeed >= 3
-  ) {
-    risk = "HIGH";
-  } else if (
-    distance <= 30 &&
-    speedDifference >= 8
-  ) {
-    risk = "MEDIUM";
-  } else if (
-    distance <= 50
-  ) {
-    risk = "EARLY";
+  const MIN_MOVING_SPEED = 3;
+
+  const ownMoving =
+    ownSpeed >=
+    MIN_MOVING_SPEED;
+
+  const nearbyMoving =
+    nearbySpeed >=
+    MIN_MOVING_SPEED;
+
+  /*
+   * Direction is considered reliable only when both
+   * vehicles are moving fast enough for direction
+   * information to be meaningful.
+   */
+  const reliableDirection =
+    ownMoving &&
+    nearbyMoving &&
+    Number.isFinite(
+      ownDirection
+    ) &&
+    Number.isFinite(
+      nearbyDirection
+    );
+
+  // -----------------------------------------------------
+  // GPS UNCERTAINTY
+  // -----------------------------------------------------
+
+  /*
+   * Combine the reported GPS uncertainty of both phones.
+   *
+   * Example:
+   * Phone A = ±5.2 m
+   * Phone B = ±3.0 m
+   *
+   * Combined uncertainty ≈ 8.2 m.
+   */
+  const combinedUncertainty =
+    Math.max(
+      1,
+      ownAccuracy +
+        nearbyAccuracy
+    );
+
+  // -----------------------------------------------------
+  // MOVEMENT / CLOSING SPEED
+  // -----------------------------------------------------
+
+  let closingSpeedKmh = 0;
+
+  let approaching = false;
+
+  let directionDifference =
+    null;
+
+  let predictionConfidence = 0;
+
+  let timeToCollision = null;
+
+  if (reliableDirection) {
+    const ownRadians =
+      (ownDirection *
+        Math.PI) /
+      180;
+
+    const nearbyRadians =
+      (nearbyDirection *
+        Math.PI) /
+      180;
+
+    /*
+     * Compass convention:
+     *
+     * 0°   = North
+     * 90°  = East
+     * 180° = South
+     * 270° = West
+     */
+    const ownVector = {
+      x:
+        Math.sin(
+          ownRadians
+        ),
+
+      y:
+        Math.cos(
+          ownRadians
+        ),
+    };
+
+    const nearbyVector = {
+      x:
+        Math.sin(
+          nearbyRadians
+        ),
+
+      y:
+        Math.cos(
+          nearbyRadians
+        ),
+    };
+
+    // ---------------------------------------------------
+    // RELATIVE GPS POSITION
+    // ---------------------------------------------------
+
+    const deltaLat =
+      nearbyVehicle.latitude -
+      ownVehicle.latitude;
+
+    const deltaLon =
+      nearbyVehicle.longitude -
+      ownVehicle.longitude;
+
+    const latitudeScale =
+      111320;
+
+    const longitudeScale =
+      111320 *
+      Math.cos(
+        (ownVehicle.latitude *
+          Math.PI) /
+          180
+      );
+
+    const relativePosition = {
+      x:
+        deltaLon *
+        longitudeScale,
+
+      y:
+        deltaLat *
+        latitudeScale,
+    };
+
+    const relativeDistance =
+      Math.sqrt(
+        relativePosition.x *
+          relativePosition.x +
+        relativePosition.y *
+          relativePosition.y
+      );
+
+    if (
+      relativeDistance >
+      0.1
+    ) {
+      // Unit vector from our vehicle toward nearby vehicle.
+      const directionToNearby = {
+        x:
+          relativePosition.x /
+          relativeDistance,
+
+        y:
+          relativePosition.y /
+          relativeDistance,
+      };
+
+      // Convert km/h to m/s.
+      const ownSpeedMs =
+        ownSpeed / 3.6;
+
+      const nearbySpeedMs =
+        nearbySpeed / 3.6;
+
+      const ownVelocity = {
+        x:
+          ownVector.x *
+          ownSpeedMs,
+
+        y:
+          ownVector.y *
+          ownSpeedMs,
+      };
+
+      const nearbyVelocity = {
+        x:
+          nearbyVector.x *
+          nearbySpeedMs,
+
+        y:
+          nearbyVector.y *
+          nearbySpeedMs,
+      };
+
+      /*
+       * Relative velocity of the nearby vehicle
+       * with respect to our vehicle.
+       */
+      const relativeVelocity = {
+        x:
+          nearbyVelocity.x -
+          ownVelocity.x,
+
+        y:
+          nearbyVelocity.y -
+          ownVelocity.y,
+      };
+
+      /*
+       * Positive closing speed means the separation
+       * between the vehicles is decreasing.
+       */
+      const closingSpeedMs =
+        -(
+          relativeVelocity.x *
+            directionToNearby.x +
+          relativeVelocity.y *
+            directionToNearby.y
+        );
+
+      closingSpeedKmh =
+        Math.max(
+          0,
+          closingSpeedMs * 3.6
+        );
+
+      /*
+       * Ignore tiny fluctuations caused by GPS noise.
+       */
+      approaching =
+        closingSpeedKmh >= 2;
+
+      /*
+       * TTC is only meaningful when the vehicles
+       * are actually approaching.
+       */
+      if (
+        approaching &&
+        closingSpeedMs > 0
+      ) {
+        timeToCollision =
+          distance /
+          closingSpeedMs;
+      }
+
+      // -------------------------------------------------
+      // DIRECTION DIFFERENCE
+      // -------------------------------------------------
+
+      let angleDifference =
+        Math.abs(
+          ownDirection -
+            nearbyDirection
+        );
+
+      if (
+        angleDifference >
+        180
+      ) {
+        angleDifference =
+          360 -
+          angleDifference;
+      }
+
+      directionDifference =
+        angleDifference;
+
+      // -------------------------------------------------
+      // PREDICTION CONFIDENCE
+      // -------------------------------------------------
+
+      /*
+       * Better GPS accuracy = higher confidence.
+       */
+      const accuracyScore =
+        Math.max(
+          0,
+          Math.min(
+            100,
+            100 -
+              combinedUncertainty *
+                5
+          )
+        );
+
+      /*
+       * Higher speed gives more useful movement
+       * information than extremely slow movement.
+       */
+      const speedScore =
+        Math.min(
+          100,
+          Math.max(
+            0,
+            (
+              Math.min(
+                ownSpeed,
+                nearbySpeed
+              ) /
+              30
+            ) *
+              100
+          )
+        );
+
+      predictionConfidence =
+        Math.round(
+          accuracyScore * 0.6 +
+            speedScore * 0.4
+        );
+    }
   }
 
+  // =====================================================
+  // RISK DECISION
+  // =====================================================
+
+  let risk = "SAFE";
+
+  /*
+   * IMPORTANT:
+   *
+   * Distance alone can NEVER produce HIGH or CRITICAL.
+   *
+   * This prevents two stationary/slow vehicles sitting
+   * side-by-side from generating a collision alarm.
+   */
+
+  if (!reliableDirection) {
+    /*
+     * Vehicle may be nearby, but there isn't enough
+     * movement/direction information to predict collision.
+     */
+    if (distance <= 50) {
+      risk = "EARLY";
+    } else {
+      risk = "SAFE";
+    }
+  } else if (!approaching) {
+    /*
+     * Vehicles are moving, but the calculated separation
+     * is not decreasing.
+     *
+     * Therefore this is NOT a collision threat.
+     */
+    if (distance <= 50) {
+      risk = "EARLY";
+    } else {
+      risk = "SAFE";
+    }
+  } else {
+    /*
+     * Vehicles are actually approaching.
+     */
+
+    const effectiveDistance =
+      Math.max(
+        0,
+        distance -
+          combinedUncertainty
+      );
+
+    // ---------------------------------------------------
+    // CRITICAL
+    // ---------------------------------------------------
+
+    if (
+      timeToCollision !==
+        null &&
+      timeToCollision <=
+        1.5 &&
+      effectiveDistance <=
+        15 &&
+      closingSpeedKmh >=
+        10 &&
+      predictionConfidence >=
+        60
+    ) {
+      risk = "CRITICAL";
+    }
+
+    // ---------------------------------------------------
+    // HIGH
+    // ---------------------------------------------------
+
+    else if (
+      timeToCollision !==
+        null &&
+      timeToCollision <=
+        3 &&
+      effectiveDistance <=
+        30 &&
+      closingSpeedKmh >=
+        5 &&
+      predictionConfidence >=
+        50
+    ) {
+      risk = "HIGH";
+    }
+
+    // ---------------------------------------------------
+    // MEDIUM
+    // ---------------------------------------------------
+
+    else if (
+      timeToCollision !==
+        null &&
+      timeToCollision <=
+        6 &&
+      effectiveDistance <=
+        50 &&
+      closingSpeedKmh >=
+        3
+    ) {
+      risk = "MEDIUM";
+    }
+
+    // ---------------------------------------------------
+    // EARLY
+    // ---------------------------------------------------
+
+    else if (
+      distance <= 100 &&
+      approaching
+    ) {
+      risk = "EARLY";
+    }
+  }
+
+  // =====================================================
+  // BRAKING
+  // =====================================================
+
+  /*
+   * Braking alone must NOT create HIGH or CRITICAL.
+   *
+   * It can increase an existing EARLY approaching
+   * situation to MEDIUM.
+   */
   if (
     nearbyBraking &&
-    distance <= 20 &&
+    approaching &&
+    distance <= 30 &&
     risk === "EARLY"
   ) {
     risk = "MEDIUM";
   }
+
+  // =====================================================
+  // RESULT
+  // =====================================================
 
   return {
     risk,
@@ -457,9 +889,44 @@ function calculateCollisionRisk(
         distance.toFixed(1)
       ),
 
-    ownSpeed,
+    ownSpeed:
+      Number(
+        ownSpeed.toFixed(1)
+      ),
 
-    nearbySpeed,
+    nearbySpeed:
+      Number(
+        nearbySpeed.toFixed(1)
+      ),
+
+    closingSpeed:
+      Number(
+        closingSpeedKmh.toFixed(1)
+      ),
+
+    approaching,
+
+    timeToCollision:
+      timeToCollision === null
+        ? null
+        : Number(
+            timeToCollision.toFixed(
+              1
+            )
+          ),
+
+    directionDifference,
+
+    predictionConfidence,
+
+    gpsUncertainty:
+      Number(
+        combinedUncertainty.toFixed(
+          1
+        )
+      ),
+
+    reliableDirection,
 
     nearbyBraking,
   };
@@ -525,8 +992,7 @@ function buildNearbyVehicleData(
       continue;
     }
 
-    // Never expose Firebase UID or
-    // internal socket ID to clients.
+    // Never expose Firebase UID or internal socket ID.
     const {
       ownerUid: _ownerUid,
       socketId: _socketId,
@@ -577,6 +1043,33 @@ function findPrimaryThreat(
 
       distance:
         result.distance,
+
+      ownSpeed:
+        result.ownSpeed,
+
+      nearbySpeed:
+        result.nearbySpeed,
+
+      closingSpeed:
+        result.closingSpeed,
+
+      approaching:
+        result.approaching,
+
+      timeToCollision:
+        result.timeToCollision,
+
+      directionDifference:
+        result.directionDifference,
+
+      predictionConfidence:
+        result.predictionConfidence,
+
+      gpsUncertainty:
+        result.gpsUncertainty,
+
+      reliableDirection:
+        result.reliableDirection,
     };
 
     if (
@@ -794,6 +1287,24 @@ function broadcastVehicleData() {
           braking:
             primaryThreat.braking ===
             true,
+
+          closingSpeed:
+            primaryThreat.closingSpeed,
+
+          approaching:
+            primaryThreat.approaching,
+
+          timeToCollision:
+            primaryThreat.timeToCollision,
+
+          predictionConfidence:
+            primaryThreat.predictionConfidence,
+
+          gpsUncertainty:
+            primaryThreat.gpsUncertainty,
+
+          reliableDirection:
+            primaryThreat.reliableDirection,
 
           message:
             createWarningMessage(
