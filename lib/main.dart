@@ -3,12 +3,11 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'firebase_options.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
@@ -28,11 +27,6 @@ Future<void> main() async {
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
-
-  // Production identity: every app installation gets a Firebase UID.
-  // This UID is later stored as ownerUid on the vehicle document so
-  // Firestore rules can enforce vehicle ownership.
-  await FirebaseAuth.instance.signInAnonymously();
 
   runApp(
     const V2VApp(),
@@ -104,16 +98,20 @@ class _V2VHomePageState
   final V2VService v2vService =
       V2VService();
 
-  // Firebase identity used to own this vehicle's Firestore document.
-  String get ownerUid =>
-      FirebaseAuth.instance.currentUser?.uid ?? '';
+  // Android notification-channel audio. Collision warnings use this instead
+  // of the normal media player so Android routes the alert through the
+  // notification volume/channel.
+  final FlutterLocalNotificationsPlugin _localNotifications =
+      FlutterLocalNotificationsPlugin();
 
-  // Native Android collision audio. The Android side uses
-  // AudioAttributes.USAGE_NOTIFICATION, so the alert uses the phone's
-  // notification/alert volume without creating a notification card.
-  static const MethodChannel _collisionAudioChannel =
-      MethodChannel('v2v_collision_audio');
+  static const String _collisionNotificationChannelId =
+      'v2v_collision_alerts';
+  static const String _collisionNotificationChannelName =
+      'V2V Safety Alerts';
+  static const String _collisionNotificationSound =
+      'collision_warning_chicken_squawk';
 
+  bool _notificationsReady = false;
 
   final MapController mapController =
       MapController();
@@ -1754,19 +1752,55 @@ class _V2VHomePageState
 
   Future<void> _initializeCollisionAudio() async {
     try {
-      await _collisionAudioChannel.invokeMethod<void>('initialize');
+      const AndroidInitializationSettings androidSettings =
+          AndroidInitializationSettings('ic_launcher');
 
-      collisionAudioReady = true;
-
-      debugPrint(
-        'COLLISION AUDIO READY: native Android notification-volume audio',
+      final InitializationSettings settings =
+          const InitializationSettings(
+        android: androidSettings,
       );
+
+      await _localNotifications.initialize(
+        settings: settings,
+      );
+
+      final AndroidFlutterLocalNotificationsPlugin? androidPlugin =
+          _localNotifications
+              .resolvePlatformSpecificImplementation<
+                  AndroidFlutterLocalNotificationsPlugin>();
+
+      if (androidPlugin != null) {
+        await androidPlugin.requestNotificationsPermission();
+
+        // IMPORTANT: Android notification channels keep their sound settings
+        // after creation. If this channel already existed with the old sound,
+        // uninstall/reinstall the app once so Android recreates the channel.
+        const AndroidNotificationChannel channel =
+            AndroidNotificationChannel(
+          _collisionNotificationChannelId,
+          _collisionNotificationChannelName,
+          description: 'Critical V2V collision safety alerts.',
+          importance: Importance.max,
+          playSound: true,
+          sound: RawResourceAndroidNotificationSound(
+            _collisionNotificationSound,
+          ),
+          enableVibration: false,
+          audioAttributesUsage: AudioAttributesUsage.notification,
+        );
+
+        await androidPlugin.createNotificationChannel(channel);
+      }
+
+      _notificationsReady = true;
+      collisionAudioReady = true;
     } catch (e) {
+      _notificationsReady = false;
       collisionAudioReady = false;
       _audioInitFuture = null;
 
       debugPrint(
-        'NATIVE COLLISION AUDIO INIT ERROR: $e',
+        'NOTIFICATION AUDIO INIT ERROR: $e',
       );
     }
   }
@@ -1776,8 +1810,9 @@ class _V2VHomePageState
   // =====================================================
 
   Future<void> playCollisionWarning() async {
-    // Hard lock: prevent duplicate alert sounds from simultaneous GPS/V2V
-    // collision events.
+    // Hard lock: sound may play only once until the current notification
+    // cooldown finishes. This prevents rapid re-triggers from GPS updates +
+    // backend collisionWarning arriving together.
     if (warningSoundPlaying) {
       return;
     }
@@ -1787,20 +1822,47 @@ class _V2VHomePageState
     try {
       await initializeCollisionAudio();
 
-      if (!collisionAudioReady) {
+      if (!_notificationsReady) {
         return;
       }
 
-      await _collisionAudioChannel.invokeMethod<void>('play');
+      const AndroidNotificationDetails androidDetails =
+          AndroidNotificationDetails(
+        _collisionNotificationChannelId,
+        _collisionNotificationChannelName,
+        channelDescription: 'Critical V2V collision safety alerts.',
+        importance: Importance.max,
+        priority: Priority.max,
+        playSound: true,
+        sound: RawResourceAndroidNotificationSound(
+          _collisionNotificationSound,
+        ),
+        enableVibration: false,
+        audioAttributesUsage: AudioAttributesUsage.notification,
+        autoCancel: true,
+        onlyAlertOnce: true,
+      );
 
-      // Keep the lock briefly so the same danger episode cannot retrigger
-      // the sound repeatedly on consecutive GPS/backend updates.
+      const NotificationDetails notificationDetails =
+          NotificationDetails(
+        android: androidDetails,
+      );
+
+     await _localNotifications.show(
+  id: 7001,
+  title: 'CRITICAL V2V ALERT',
+  body: 'Immediate collision risk detected.',
+  notificationDetails: notificationDetails,
+);
+
+      // Keep the lock long enough to prevent duplicate alert notifications
+      // from arriving from multiple V2V/GPS code paths.
       await Future<void>.delayed(
         const Duration(seconds: 4),
       );
     } catch (e) {
       debugPrint(
-        'NATIVE COLLISION AUDIO PLAY ERROR: $e',
+        'WARNING NOTIFICATION ERROR: $e',
       );
     } finally {
       warningSoundPlaying = false;
@@ -1919,7 +1981,7 @@ class _V2VHomePageState
       );
 
       _showSnackBar(
-        'Collision sound and vibration tested.',
+        'Warning sound and vibration tested.',
         Colors.green,
       );
     } catch (e) {
@@ -4060,6 +4122,20 @@ class _V2VHomePageState
       return 'SAFE';
     }
 
+    // Built-in simulator demo: use its explicitly scripted risk level so the
+    // UI can reliably demonstrate EARLY → MEDIUM → HIGH → CRITICAL. Real
+    // vehicles continue through the trajectory-based calculation below.
+    if (vehicle['demoMode'] == true) {
+      final String demoRisk =
+          _normalizeStatus(vehicle['demoRisk']);
+      if (demoRisk == 'EARLY' ||
+          demoRisk == 'MEDIUM' ||
+          demoRisk == 'HIGH' ||
+          demoRisk == 'CRITICAL') {
+        return demoRisk;
+      }
+    }
+
     final double otherSpeed = _getVehicleSpeed(vehicle);
     final bool otherBraking = vehicle['braking'] == true;
     final Map<String, double> prediction =
@@ -4187,6 +4263,10 @@ class _V2VHomePageState
       vehicle,
       distance,
     );
+
+    if (vehicle['demoMode'] == true) {
+      return rawStatus;
+    }
 
     return _stabilizeVehicleRisk(
       vehicleId,
