@@ -3941,10 +3941,16 @@ class _V2VHomePageState
             : '';
 
     final Map<String, double> prediction =
-        _calculateCollisionPrediction(
-      vehicle,
-      distance,
-    );
+    vehicle == null
+        ? <String, double>{
+            'approaching': 0,
+            'closingSpeedKmh': 0,
+            'ttcSeconds': double.infinity,
+          }
+        : _calculateCollisionPrediction(
+            vehicle,
+            distance,
+          );
     final bool approaching = (prediction['approaching'] ?? 0) == 1;
     final double closingSpeed = prediction['closingSpeedKmh'] ?? 0;
     final double ttc = prediction['ttcSeconds'] ?? double.infinity;

@@ -1468,7 +1468,7 @@ function startSingleSimulation() {
   // SIMULATION CONFIGURATION
   // -----------------------------------------------------
 
-  const SIMULATION_SPEED_KMH = 35;
+  const SIMULATION_SPEED_KMH = 25;
 
   const START_DISTANCE_M = 100;
 
