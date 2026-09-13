@@ -7,7 +7,7 @@ import 'firebase_options.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:audioplayers/audioplayers.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
@@ -33,10 +33,23 @@ Future<void> main() async {
   );
 }
 
-class V2VApp extends StatelessWidget {
+class V2VApp extends StatefulWidget {
   const V2VApp({
     super.key,
   });
+
+  @override
+  State<V2VApp> createState() => _V2VAppState();
+}
+
+class _V2VAppState extends State<V2VApp> {
+  bool _darkMode = false;
+
+  void _toggleDarkMode() {
+    setState(() {
+      _darkMode = !_darkMode;
+    });
+  }
 
   @override
   Widget build(
@@ -45,11 +58,55 @@ class V2VApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'SMART V2V Communication',
+      themeMode: _darkMode ? ThemeMode.dark : ThemeMode.light,
       theme: ThemeData(
-        colorSchemeSeed: Colors.indigo,
+        brightness: Brightness.light,
         useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF4F46E5),
+          brightness: Brightness.light,
+          surface: const Color(0xFFF8F9FF),
+        ),
+        scaffoldBackgroundColor: const Color(0xFFF3F5FF),
+        cardColor: Colors.white,
+        cardTheme: const CardThemeData(
+          color: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          elevation: 2,
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFFF3F5FF),
+          surfaceTintColor: Colors.transparent,
+          foregroundColor: Color(0xFF171923),
+          elevation: 0,
+        ),
       ),
-      home: const V2VHomePage(),
+      darkTheme: ThemeData(
+        brightness: Brightness.dark,
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF7C83FF),
+          brightness: Brightness.dark,
+          surface: const Color(0xFF10131B),
+        ),
+        scaffoldBackgroundColor: const Color(0xFF05060B),
+        cardColor: const Color(0xFF11141D),
+        cardTheme: const CardThemeData(
+          color: Color(0xFF11141D),
+          surfaceTintColor: Colors.transparent,
+          elevation: 4,
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF070910),
+          surfaceTintColor: Colors.transparent,
+          foregroundColor: Colors.white,
+          elevation: 0,
+        ),
+      ),
+      home: V2VHomePage(
+        isDarkMode: _darkMode,
+        onToggleDarkMode: _toggleDarkMode,
+      ),
     );
   }
 }
@@ -61,7 +118,12 @@ class V2VApp extends StatelessWidget {
 class V2VHomePage extends StatefulWidget {
   const V2VHomePage({
     super.key,
+    required this.isDarkMode,
+    required this.onToggleDarkMode,
   });
+
+  final bool isDarkMode;
+  final VoidCallback onToggleDarkMode;
 
   @override
   State<V2VHomePage> createState() =>
@@ -98,20 +160,9 @@ class _V2VHomePageState
   final V2VService v2vService =
       V2VService();
 
-  // Android notification-channel audio. Collision warnings use this instead
-  // of the normal media player so Android routes the alert through the
-  // notification volume/channel.
-  final FlutterLocalNotificationsPlugin _localNotifications =
-      FlutterLocalNotificationsPlugin();
-
-  static const String _collisionNotificationChannelId =
-      'v2v_collision_alerts';
-  static const String _collisionNotificationChannelName =
-      'V2V Safety Alerts';
-  static const String _collisionNotificationSound =
-      'collision_warning_chicken_squawk';
-
-  bool _notificationsReady = false;
+  // In-app collision audio only. This deliberately does NOT use
+  // flutter_local_notifications, so no Android notification is posted.
+  final AudioPlayer _collisionPlayer = AudioPlayer();
 
   final MapController mapController =
       MapController();
@@ -867,6 +918,48 @@ class _V2VHomePageState
     Map<String, dynamic> vehicle,
     double distance,
   ) {
+    // Built-in simulator values are authoritative for the simulated vehicle.
+    // This keeps the test deterministic even when the real phone is stationary
+    // and therefore cannot provide its own reliable heading.
+    if (vehicle['simulated'] == true && vehicle['demoMode'] == true) {
+      final bool demoApproaching =
+          vehicle['demoApproaching'] != false;
+      final double demoClosing = _toDouble(
+        vehicle['demoClosingSpeedKmh'],
+        fallback: demoApproaching ? 35.0 : 0.0,
+      );
+      final dynamic rawTtc = vehicle['demoTtcSeconds'];
+      final double demoTtc = rawTtc == null
+          ? double.infinity
+          : _toDouble(rawTtc, fallback: double.infinity);
+      final double demoSpeed = _getVehicleSpeed(vehicle);
+      final double demoAccuracy = _toDouble(
+        vehicle['gpsAccuracy'] ?? vehicle['accuracy'],
+        fallback: 1.0,
+      );
+
+      return {
+        'closingSpeedKmh': demoApproaching ? max(0, demoClosing) : 0,
+        'closingSpeedMps': demoApproaching ? max(0, demoClosing) / 3.6 : 0,
+        'ttcSeconds': demoTtc,
+        'timeToClosestApproachSeconds': demoTtc,
+        'predictedMissDistanceMeters': demoApproaching ? 0 : distance,
+        'longitudinalMeters': demoApproaching ? -distance : distance,
+        'lateralMeters': 0,
+        'approaching': demoApproaching ? 1 : 0,
+        'collisionPath': demoApproaching ? 1 : 0,
+        'directionReliable': 1,
+        'remoteFresh': 1,
+        'ownFresh': 1,
+        'accuracyReliable': 1,
+        'headingDifferenceDegrees': demoApproaching ? 180 : 0,
+        'combinedUncertaintyMeters': demoAccuracy + 1.0,
+        'gpsConfidence': 95,
+        'remoteAccuracyMeters': demoAccuracy,
+        'speedKmh': demoSpeed,
+      };
+    }
+
     final Map<String, double> trajectoryEstimate =
         _getTrajectoryEstimate(vehicle);
 
@@ -1633,6 +1726,56 @@ class _V2VHomePageState
         _requiredHighConfirmations;
   }
 
+  // True only when the remote vehicle is explicitly reported as approaching,
+  // or when the local trajectory model independently confirms approach.
+  bool _isVehicleApproaching(Map<String, dynamic>? vehicle) {
+    if (vehicle == null) {
+      return false;
+    }
+
+    final dynamic explicitValue =
+        vehicle['approaching'] ??
+        vehicle['isApproaching'] ??
+        vehicle['closing'] ??
+        vehicle['isClosing'];
+
+    if (explicitValue is bool) {
+      return explicitValue;
+    }
+
+    if (explicitValue is num) {
+      return explicitValue != 0;
+    }
+
+    if (explicitValue != null) {
+      final String normalized =
+          explicitValue.toString().trim().toLowerCase();
+      if (normalized == 'true' ||
+          normalized == 'yes' ||
+          normalized == 'approaching' ||
+          normalized == 'closing') {
+        return true;
+      }
+      if (normalized == 'false' ||
+          normalized == 'no' ||
+          normalized == 'not approaching' ||
+          normalized == 'separating') {
+        return false;
+      }
+    }
+
+    final double distance = _distanceFromVehicle(vehicle);
+    if (!distance.isFinite) {
+      return false;
+    }
+
+    final Map<String, double> prediction =
+        _calculateCollisionPrediction(vehicle, distance);
+
+    return (prediction['directionReliable'] ?? 0) == 1 &&
+        (prediction['approaching'] ?? 0) == 1;
+  }
+
   // HIGH and lower warning levels are visual-only. Sound and vibration are
   // reserved exclusively for a confirmed CRITICAL event at 5 metres or less.
   bool _shouldPlayHighAlert(
@@ -1644,16 +1787,19 @@ class _V2VHomePageState
   bool _shouldPlayCriticalAlert(
     String vehicleId,
     double distanceMeters,
+    Map<String, dynamic>? vehicle,
   ) {
-    // Never play the emergency alert unless the actual measured distance is
-    // within the 5 m critical zone.
+    // HARD SAFETY GATE: sound/vibration require BOTH conditions:
+    //   1. measured distance is 5 m or less
+    //   2. the remote vehicle is actually approaching this phone
     if (!distanceMeters.isFinite ||
-        distanceMeters > _criticalDistanceMeters) {
+        distanceMeters > _criticalDistanceMeters ||
+        !_isVehicleApproaching(vehicle)) {
       return false;
     }
 
-    // CRITICAL is already GPS-confidence gated by the risk model. This helper
-    // only controls the one-shot sound/vibration for that confirmed status.
+    // CRITICAL is GPS-confidence/trajectory gated by the risk model. This
+    // helper adds the final 5 m + approaching gate for the emergency alert.
 
     // Unknown IDs are not allowed to bypass the one-shot protection.
     if (vehicleId.isEmpty || vehicleId == 'UNKNOWN') {
@@ -1742,7 +1888,7 @@ class _V2VHomePageState
   }
 
   // =====================================================
-  // NOTIFICATION AUDIO INITIALIZATION
+  // IN-APP AUDIO INITIALIZATION
   // =====================================================
 
   Future<void> initializeCollisionAudio() {
@@ -1752,56 +1898,16 @@ class _V2VHomePageState
 
   Future<void> _initializeCollisionAudio() async {
     try {
-      const AndroidInitializationSettings androidSettings =
-          AndroidInitializationSettings('ic_launcher');
-
-      final InitializationSettings settings =
-          const InitializationSettings(
-        android: androidSettings,
-      );
-
-      await _localNotifications.initialize(
-        settings: settings,
-      );
-
-      final AndroidFlutterLocalNotificationsPlugin? androidPlugin =
-          _localNotifications
-              .resolvePlatformSpecificImplementation<
-                  AndroidFlutterLocalNotificationsPlugin>();
-
-      if (androidPlugin != null) {
-        await androidPlugin.requestNotificationsPermission();
-
-        // IMPORTANT: Android notification channels keep their sound settings
-        // after creation. If this channel already existed with the old sound,
-        // uninstall/reinstall the app once so Android recreates the channel.
-        const AndroidNotificationChannel channel =
-            AndroidNotificationChannel(
-          _collisionNotificationChannelId,
-          _collisionNotificationChannelName,
-          description: 'Critical V2V collision safety alerts.',
-          importance: Importance.max,
-          playSound: true,
-          sound: RawResourceAndroidNotificationSound(
-            _collisionNotificationSound,
-          ),
-          enableVibration: false,
-          audioAttributesUsage: AudioAttributesUsage.notification,
-        );
-
-        await androidPlugin.createNotificationChannel(channel);
-      }
-
-      _notificationsReady = true;
+      await _collisionPlayer.setReleaseMode(ReleaseMode.stop);
+      await _collisionPlayer.setVolume(1.0);
       collisionAudioReady = true;
+
+      debugPrint('IN-APP COLLISION AUDIO READY');
     } catch (e) {
-      _notificationsReady = false;
       collisionAudioReady = false;
       _audioInitFuture = null;
 
-      debugPrint(
-        'NOTIFICATION AUDIO INIT ERROR: $e',
-      );
+      debugPrint('IN-APP COLLISION AUDIO INIT ERROR: $e');
     }
   }
 
@@ -1810,9 +1916,8 @@ class _V2VHomePageState
   // =====================================================
 
   Future<void> playCollisionWarning() async {
-    // Hard lock: sound may play only once until the current notification
-    // cooldown finishes. This prevents rapid re-triggers from GPS updates +
-    // backend collisionWarning arriving together.
+    // This is an in-app media sound. It does NOT create an Android
+    // notification, notification channel, or notification-tray entry.
     if (warningSoundPlaying) {
       return;
     }
@@ -1822,47 +1927,21 @@ class _V2VHomePageState
     try {
       await initializeCollisionAudio();
 
-      if (!_notificationsReady) {
+      if (!collisionAudioReady) {
         return;
       }
 
-      const AndroidNotificationDetails androidDetails =
-          AndroidNotificationDetails(
-        _collisionNotificationChannelId,
-        _collisionNotificationChannelName,
-        channelDescription: 'Critical V2V collision safety alerts.',
-        importance: Importance.max,
-        priority: Priority.max,
-        playSound: true,
-        sound: RawResourceAndroidNotificationSound(
-          _collisionNotificationSound,
+      await _collisionPlayer.stop();
+      await _collisionPlayer.play(
+        AssetSource(
+          'audio/collision_warning_chicken_squawk.wav',
         ),
-        enableVibration: false,
-        audioAttributesUsage: AudioAttributesUsage.notification,
-        autoCancel: true,
-        onlyAlertOnce: true,
       );
 
-      const NotificationDetails notificationDetails =
-          NotificationDetails(
-        android: androidDetails,
-      );
-
-     await _localNotifications.show(
-  id: 7001,
-  title: 'CRITICAL V2V ALERT',
-  body: 'Immediate collision risk detected.',
-  notificationDetails: notificationDetails,
-);
-
-      // Keep the lock long enough to prevent duplicate alert notifications
-      // from arriving from multiple V2V/GPS code paths.
-      await Future<void>.delayed(
-        const Duration(seconds: 4),
-      );
+      debugPrint('CRITICAL IN-APP SOUND PLAYED');
     } catch (e) {
       debugPrint(
-        'WARNING NOTIFICATION ERROR: $e',
+        'IN-APP COLLISION AUDIO ERROR: $e',
       );
     } finally {
       warningSoundPlaying = false;
@@ -1889,6 +1968,7 @@ class _V2VHomePageState
       await Vibration.vibrate(
         pattern: pattern,
       );
+      debugPrint('CRITICAL VIBRATION PLAYED');
     } catch (e) {
       debugPrint(
         'VIBRATION ERROR: $e',
@@ -1965,7 +2045,7 @@ class _V2VHomePageState
 
       if (!collisionAudioReady) {
         _showSnackBar(
-          'Warning audio is not ready.',
+          'In-app warning audio is not ready.',
           Colors.orange,
         );
         return;
@@ -2252,7 +2332,7 @@ class _V2VHomePageState
     _vehicleRiskConfirmations.clear();
 
     v2vService.disconnect();
-
+    _collisionPlayer.dispose();
 
     super.dispose();
   }
@@ -3617,9 +3697,9 @@ class _V2VHomePageState
       extractedVehicle,
     );
 
-    // The 5 m rule is distance-based. If the backend sends HIGH/EARLY because
-    // of its own speed/risk rules, promote the event to CRITICAL when the
-    // actual supplied/measured distance is within 5 metres.
+    // The emergency state is allowed only when the measured distance is
+    // within 5 m AND the remote vehicle is actually approaching this phone.
+    // A close but stationary/parallel vehicle remains monitoring-only.
     final double incomingDistance =
         extractedVehicle == null
             ? _toDouble(
@@ -3630,9 +3710,34 @@ class _V2VHomePageState
                 extractedVehicle,
               );
 
+    bool incomingApproaching =
+        _isVehicleApproaching(extractedVehicle);
+
+    // Some Socket.IO payloads put the approach flag beside the vehicle object
+    // rather than inside it. Use that value only when the nested vehicle did
+    // not already provide an explicit value.
+    if (!incomingApproaching && extractedVehicle != null) {
+      final dynamic topLevelApproaching =
+          data['approaching'] ??
+          data['isApproaching'] ??
+          data['closing'] ??
+          data['isClosing'];
+      if (topLevelApproaching is bool) {
+        incomingApproaching = topLevelApproaching;
+      } else if (topLevelApproaching is num) {
+        incomingApproaching = topLevelApproaching != 0;
+      }
+    }
+
     if (incomingDistance.isFinite &&
-        incomingDistance <= _criticalDistanceMeters) {
+        incomingDistance <= _criticalDistanceMeters &&
+        incomingApproaching) {
       incomingStatus = 'CRITICAL';
+    } else if ((incomingStatus == 'CRITICAL' || incomingStatus == 'HIGH') &&
+        !incomingApproaching) {
+      // Never display a CRITICAL collision state for a vehicle that is not
+      // approaching. Keep it at the safer monitoring level.
+      incomingStatus = 'EARLY';
     }
 
     // Ignore collision events for our own vehicle.
@@ -3755,6 +3860,7 @@ class _V2VHomePageState
           _shouldPlayCriticalAlert(
         incomingVehicleId,
         incomingDistance,
+        extractedVehicle,
       );
 
       awaitWarningAction(
@@ -3794,10 +3900,13 @@ class _V2VHomePageState
       return;
     }
 
-    // The caller has already passed _shouldPlayCriticalAlert(), so this pair
-    // can happen only once for the current danger episode.
-    await playCollisionWarning();
-    await vibrateForWarning('CRITICAL');
+    // Start sound and vibration together. Do NOT await the sound first:
+    // playCollisionWarning intentionally keeps a short duplicate lock, and
+    // waiting for it would delay vibration by several seconds.
+    await Future.wait<void>([
+      playCollisionWarning(),
+      vibrateForWarning('CRITICAL'),
+    ]);
   }
 
   // =====================================================
@@ -3831,14 +3940,31 @@ class _V2VHomePageState
             ? ' (${distance.toStringAsFixed(1)} m away)'
             : '';
 
+    final Map<String, double> prediction =
+        _calculateCollisionPrediction(
+      vehicle,
+      distance,
+    );
+    final bool approaching = (prediction['approaching'] ?? 0) == 1;
+    final double closingSpeed = prediction['closingSpeedKmh'] ?? 0;
+    final double ttc = prediction['ttcSeconds'] ?? double.infinity;
+
+    String reason = approaching
+        ? 'vehicle is approaching at ${closingSpeed.toStringAsFixed(0)} km/h'
+        : 'no confirmed closing trajectory';
+
+    if (ttc.isFinite && ttc > 0) {
+      reason += ', TTC ${ttc.toStringAsFixed(1)} s';
+    }
+
     switch (status) {
       case 'CRITICAL':
         return 'CRITICAL COLLISION WARNING: '
-            '$vehicleName is dangerously close$distanceText.';
+            '$vehicleName is dangerously close$distanceText; $reason.';
 
       case 'HIGH':
         return 'HIGH COLLISION RISK: '
-            '$vehicleName is approaching$distanceText.';
+            '$vehicleName is approaching$distanceText; $reason.';
 
       case 'MEDIUM':
         return 'CAUTION: '
@@ -4096,6 +4222,7 @@ class _V2VHomePageState
         _distanceFromVehicle(
           vehicle,
         ),
+        vehicle,
       );
 
       awaitWarningAction(
@@ -4122,16 +4249,11 @@ class _V2VHomePageState
       return 'SAFE';
     }
 
-    // Built-in simulator demo: use its explicitly scripted risk level so the
-    // UI can reliably demonstrate EARLY → MEDIUM → HIGH → CRITICAL. Real
-    // vehicles continue through the trajectory-based calculation below.
-    if (vehicle['demoMode'] == true) {
-      final String demoRisk =
-          _normalizeStatus(vehicle['demoRisk']);
-      if (demoRisk == 'EARLY' ||
-          demoRisk == 'MEDIUM' ||
-          demoRisk == 'HIGH' ||
-          demoRisk == 'CRITICAL') {
+    // The built-in simulator supplies deterministic risk states. Do not let
+    // the real phone's stationary GPS heading override those test states.
+    if (vehicle['simulated'] == true && vehicle['demoMode'] == true) {
+      final String demoRisk = vehicle['demoRisk']?.toString().toUpperCase() ?? '';
+      if (const {'EARLY', 'MEDIUM', 'HIGH', 'CRITICAL'}.contains(demoRisk)) {
         return demoRisk;
       }
     }
@@ -4175,21 +4297,22 @@ class _V2VHomePageState
         combinedUncertainty <= 14.2 &&
         gpsConfidence >= 65;
 
-    if (distance <= _criticalDistanceMeters && criticalGpsReliable) {
+    if (distance <= _criticalDistanceMeters && approaching && criticalGpsReliable) {
       return 'CRITICAL';
     }
 
-    // Extremely close but uncertain: keep a strong warning without claiming
-    // that the exact 5 m position is trustworthy enough for an emergency alarm.
-    if (distance <= _criticalDistanceMeters && remoteFresh) {
-      return 'HIGH';
+    // Extremely close but NOT approaching: this is proximity monitoring,
+    // not a collision prediction. Never label a stationary/separating vehicle
+    // HIGH or CRITICAL merely because GPS says it is close.
+    if (distance <= _criticalDistanceMeters && remoteFresh && !approaching) {
+      return 'EARLY';
     }
 
     if (directionReliable && remoteFresh) {
       // Crossing/head-on/overtaking are all accepted only when the predicted
       // trajectories actually converge to a small miss distance.
       if (collisionPath && ttc.isFinite) {
-        if (ttc <= 1.5 && gpsConfidence >= 65) return 'CRITICAL';
+        if (distance <= _criticalDistanceMeters && approaching && ttc <= 1.5 && gpsConfidence >= 65) return 'CRITICAL';
         if (ttc <= 3.0) return 'HIGH';
         if (ttc <= 5.0) return 'MEDIUM';
         if (ttc <= 8.0) return 'EARLY';
@@ -4207,7 +4330,7 @@ class _V2VHomePageState
           (prediction['closingSpeedMps'] ?? 0) > 0.5;
 
       if (sameLaneLike && closingFromBehind && ttc.isFinite) {
-        if (ttc <= 1.5 && gpsConfidence >= 65) return 'CRITICAL';
+        if (distance <= _criticalDistanceMeters && approaching && ttc <= 1.5 && gpsConfidence >= 65) return 'CRITICAL';
         if (ttc <= 3.0) return 'HIGH';
         if (ttc <= 5.0) return 'MEDIUM';
         if (ttc <= 8.0) return 'EARLY';
@@ -4226,7 +4349,8 @@ class _V2VHomePageState
     // heading. In that case, retain conservative proximity monitoring, but do
     // not invent a collision prediction from distance alone.
     if (!directionReliable || !remoteFresh) {
-      if (distance <= 15.0) return 'HIGH';
+      // Without reliable direction we cannot claim a collision trajectory.
+      // Keep this as monitoring/caution only.
       if (distance <= 40.0) return 'MEDIUM';
       if (distance <= 100.0) return 'EARLY';
     }
@@ -4263,10 +4387,6 @@ class _V2VHomePageState
       vehicle,
       distance,
     );
-
-    if (vehicle['demoMode'] == true) {
-      return rawStatus;
-    }
 
     return _stabilizeVehicleRisk(
       vehicleId,
@@ -5102,6 +5222,18 @@ class _V2VHomePageState
     }
   }
     // =====================================================
+  // THEME HELPERS
+  // =====================================================
+
+  bool get _isDark => Theme.of(context).brightness == Brightness.dark;
+
+  Color get _pageColor => _isDark ? const Color(0xFF05060B) : const Color(0xFFF3F5FF);
+  Color get _cardSurface => _isDark ? const Color(0xFF11141D) : Colors.white;
+  Color get _metricSurface => _isDark ? const Color(0xFF191D28) : const Color(0xFFF8F9FF);
+  Color get _primaryText => _isDark ? const Color(0xFFF5F7FF) : const Color(0xFF171923);
+  Color get _secondaryText => _isDark ? const Color(0xFFB8C0D4) : const Color(0xFF5F6678);
+
+  // =====================================================
   // BUILD APP
   // =====================================================
 
@@ -5117,12 +5249,12 @@ class _V2VHomePageState
     return DefaultTabController(
       length: 4,
       child: Scaffold(
-        backgroundColor: const Color(0xFFF4F7FF),
+        backgroundColor: _pageColor,
         appBar: AppBar(
           elevation: 0,
-          backgroundColor: const Color(0xFFEEF2FF),
+          backgroundColor: _isDark ? const Color(0xFF070910) : const Color(0xFFF3F5FF),
           surfaceTintColor: Colors.transparent,
-          title: const Column(
+          title: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
@@ -5130,18 +5262,48 @@ class _V2VHomePageState
                 style: TextStyle(
                   fontWeight: FontWeight.bold,
                   fontSize: 20,
+                  color: _primaryText,
                 ),
               ),
               Text(
                 'Vehicle-to-Vehicle Communication',
                 style: TextStyle(
                   fontSize: 11,
-                  color: Color(0xFF5B6478),
+                  color: widget.isDarkMode
+                      ? const Color(0xFFAEB8D8)
+                      : const Color(0xFF5B6478),
                   fontWeight: FontWeight.normal,
                 ),
               ),
             ],
           ),
+          actions: [
+            Padding(
+              padding: const EdgeInsets.only(right: 10),
+              child: Material(
+                color: widget.isDarkMode
+                    ? const Color(0xFF171A2A)
+                    : const Color(0xFFE1E7FF),
+                shape: const CircleBorder(),
+                child: IconButton(
+                  onPressed: widget.onToggleDarkMode,
+                  tooltip: widget.isDarkMode
+                      ? 'Switch to light mode'
+                      : 'Switch to dark mode',
+                  iconSize: 20,
+                  visualDensity: VisualDensity.compact,
+                  color: widget.isDarkMode
+                      ? const Color(0xFFFFD54F)
+                      : const Color(0xFF4654D8),
+                  icon: Icon(
+                    widget.isDarkMode
+                        ? Icons.light_mode_rounded
+                        : Icons.dark_mode_rounded,
+                  ),
+                ),
+              ),
+            ),
+          ],
           bottom: const TabBar(
             // Keep all sections fixed on screen. This removes the empty
             // leading space and horizontal sliding of the tab bar.
@@ -5168,22 +5330,29 @@ class _V2VHomePageState
           ),
         ),
         body: Container(
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [
-                Color(0xFFF2F6FF),
-                Color(0xFFF8F4FF),
-                Color(0xFFF3FBF8),
-              ],
+              colors: _isDark
+                  ? const [
+                      Color(0xFF05060B),
+                      Color(0xFF0D1020),
+                      Color(0xFF10152A),
+                      Color(0xFF071A18),
+                    ]
+                  : const [
+                      Color(0xFFF1F5FF),
+                      Color(0xFFF8F3FF),
+                      Color(0xFFF1FBF8),
+                      Color(0xFFFFF7F0),
+                    ],
+              stops: const [0.0, 0.32, 0.68, 1.0],
             ),
           ),
           child: SafeArea(
             top: false,
-            child: RefreshIndicator(
-              onRefresh: refreshAll,
-              child: TabBarView(
+            child: TabBarView(
                 // Change sections only by tapping the tabs; disable
                 // horizontal swipe/slide between pages.
                 physics: NeverScrollableScrollPhysics(),
@@ -5262,7 +5431,6 @@ class _V2VHomePageState
                   ),
                 ],
               ),
-            ),
           ),
         ),
       ),
@@ -5341,8 +5509,7 @@ class _V2VHomePageState
               ),
               decoration:
                   BoxDecoration(
-                color:
-                    Colors.grey.shade100,
+                color: _isDark ? const Color(0xFF1A1E29) : Colors.grey.shade100,
                 borderRadius:
                     BorderRadius.circular(
                   10,
@@ -5357,8 +5524,7 @@ class _V2VHomePageState
                         : Icons
                             .info_outline_rounded,
                     size: 18,
-                    color:
-                        Colors.grey.shade700,
+                    color: _secondaryText,
                   ),
                   const SizedBox(
                     width: 8,
@@ -5636,9 +5802,9 @@ class _V2VHomePageState
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.grey.shade50,
+        color: _metricSurface,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: Colors.grey.shade200),
+        border: Border.all(color: _isDark ? const Color(0xFF2D3342) : Colors.grey.shade200),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -5829,7 +5995,7 @@ class _V2VHomePageState
           const EdgeInsets.all(12),
       decoration:
           BoxDecoration(
-        color: Colors.white,
+        color: Theme.of(context).cardColor,
         borderRadius:
             BorderRadius.circular(12),
       ),
@@ -5905,6 +6071,90 @@ class _V2VHomePageState
               ),
             ],
           ),
+          const SizedBox(height: 10),
+          _buildThreatReason(
+            status: safetyStatus,
+            distance: distance,
+            prediction: prediction,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildThreatReason({
+    required String status,
+    required double distance,
+    required Map<String, double> prediction,
+  }) {
+    final bool approaching =
+        (prediction['approaching'] ?? 0) == 1;
+    final bool directionReliable =
+        (prediction['directionReliable'] ?? 0) == 1;
+    final double closingSpeed =
+        prediction['closingSpeedKmh'] ?? 0;
+    final double ttc =
+        prediction['ttcSeconds'] ?? double.infinity;
+    final double confidence =
+        prediction['gpsConfidence'] ?? 0;
+    final double uncertainty =
+        prediction['combinedUncertaintyMeters'] ?? double.infinity;
+
+    String reason;
+    if (status == 'CRITICAL') {
+      if (approaching && ttc.isFinite) {
+        reason = 'The vehicle is approaching and the predicted collision time is ${_formatTtc(ttc)} at a closing speed of ${closingSpeed.toStringAsFixed(0)} km/h.';
+      } else if (approaching) {
+        reason = 'The vehicle is approaching rapidly and is inside the critical distance zone.';
+      } else {
+        reason = 'No confirmed approach. CRITICAL should not be shown from distance alone.';
+      }
+    } else if (status == 'HIGH') {
+      if (approaching && ttc.isFinite) {
+        reason = 'Approaching trajectory detected: TTC ${_formatTtc(ttc)} with ${closingSpeed.toStringAsFixed(0)} km/h closing speed.';
+      } else if (approaching) {
+        reason = 'The vehicle is approaching, but a reliable TTC is not available yet.';
+      } else {
+        reason = 'No confirmed approach. This vehicle should be monitoring-only, not HIGH risk.';
+      }
+    } else if (approaching && ttc.isFinite) {
+      reason = 'Potential trajectory conflict: TTC ${_formatTtc(ttc)} at ${closingSpeed.toStringAsFixed(0)} km/h closing speed.';
+    } else if (!directionReliable) {
+      reason = 'Direction is not reliable yet, so the app is using proximity monitoring instead of predicting a collision.';
+    } else {
+      reason = 'No confirmed closing trajectory. The vehicle is being monitored.';
+    }
+
+    final String gpsLine =
+        uncertainty.isFinite
+            ? 'GPS confidence ${confidence.toStringAsFixed(0)}% • uncertainty ±${uncertainty.toStringAsFixed(0)} m'
+            : 'GPS confidence ${confidence.toStringAsFixed(0)}%';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(11),
+      decoration: BoxDecoration(
+        color: _isDark ? Colors.white.withValues(alpha: 0.05) : Colors.black.withValues(alpha: 0.035),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.blueGrey.withValues(alpha: 0.12)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Why this alert?',
+            style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            reason,
+            style: const TextStyle(fontSize: 11, height: 1.3),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            'Distance ${distance.isFinite ? distance.toStringAsFixed(1) : '--'} m • $gpsLine',
+            style: TextStyle(fontSize: 10, color: Colors.grey.shade700),
+          ),
         ],
       ),
     );
@@ -5949,8 +6199,7 @@ class _V2VHomePageState
                       TextOverflow.ellipsis,
                   style: TextStyle(
                     fontSize: 9,
-                    color:
-                        Colors.grey.shade700,
+                    color: _secondaryText,
                   ),
                 ),
                 const SizedBox(height: 2),
@@ -6030,8 +6279,7 @@ class _V2VHomePageState
                   '${liveMapVehicles.length} nearby active',
                   style: TextStyle(
                     fontSize: 12,
-                    color:
-                        Colors.grey.shade700,
+                    color: _secondaryText,
                   ),
                 ),
               ],
@@ -6352,6 +6600,47 @@ class _V2VHomePageState
                   ),
                 ),
               ],
+            ),
+
+            const SizedBox(height: 8),
+
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 10,
+              ),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                color: Theme.of(context).colorScheme.primary.withValues(
+                  alpha: Theme.of(context).brightness == Brightness.dark
+                      ? 0.14
+                      : 0.07,
+                ),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    Icons.route_rounded,
+                    size: 19,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: Text(
+                      'Simulation path: 100 m → 2 m at 35 km/h, '
+                      'brief stop, then 2 m → 100 m. Repeats automatically.',
+                      style: TextStyle(
+                        fontSize: 11,
+                        height: 1.35,
+                        fontWeight: FontWeight.w600,
+                        color: Theme.of(context).colorScheme.onSurface,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
 
             const SizedBox(height: 12),
@@ -7001,8 +7290,7 @@ class _V2VHomePageState
                   '${vehicleSpeed.toStringAsFixed(0)} km/h',
                   style: TextStyle(
                     fontSize: 12,
-                    color:
-                        Colors.grey.shade700,
+                    color: _secondaryText,
                   ),
                 ),
 
@@ -7080,7 +7368,7 @@ class _V2VHomePageState
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 9,
-                            color: Colors.grey.shade500,
+                            color: _isDark ? const Color(0xFF7F889F) : Colors.grey.shade500,
                             fontWeight: FontWeight.w500,
                           ),
                         ),

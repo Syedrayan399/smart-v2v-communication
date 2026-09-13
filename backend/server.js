@@ -1415,110 +1415,77 @@ function stopAllSimulations() {
 // START DETERMINISTIC SINGLE SIMULATION
 // =====================================================
 
+// =====================================================
+// START SINGLE VEHICLE SIMULATION
+// =====================================================
+//
+// Simulation:
+//
+//   100 m
+//     ↓
+//   APPROACHING at 35 km/h
+//     ↓
+//   45 m  = MEDIUM
+//   20 m  = HIGH
+//    5 m  = CRITICAL
+//    2 m  = STOP
+//     ↓
+//   PAUSE 1.5 seconds
+//     ↓
+//    2 m
+//     ↑
+//   MOVING AWAY at 35 km/h
+//     ↑
+//   100 m
+//     ↓
+//   Repeat
+//
+// The simulated vehicle is placed directly north of the
+// real vehicle and travels along the same north/south line.
+//
+// This is DEMO/TEST data only.
+// Real vehicles continue using the normal collision algorithm.
+//
+
 function startSingleSimulation() {
   stopSingleSimulation();
 
+  // Find the first real connected vehicle.
   const realVehicles =
-    Array.from(
-      vehicles.values()
-    ).filter(
-      (vehicle) =>
-        !vehicle.simulated
+    Array.from(vehicles.values()).filter(
+      (vehicle) => !vehicle.simulated
     );
 
-  if (
-    realVehicles.length === 0
-  ) {
+  if (realVehicles.length === 0) {
     throw new Error(
       "Connect the Flutter vehicle before starting simulation."
     );
   }
 
-  const targetVehicle =
-    realVehicles[0];
+  const targetVehicle = realVehicles[0];
 
-  const simulatedVehicleId =
-    "BIKE002";
+  // -----------------------------------------------------
+  // SIMULATION CONFIGURATION
+  // -----------------------------------------------------
+
+  const SIMULATION_SPEED_KMH = 35;
+
+  const START_DISTANCE_M = 100;
+
+  const STOP_DISTANCE_M = 2;
+
+  const UPDATE_MS = 250;
+
+  const PAUSE_AT_CLOSE_MS = 1500;
+
+  const simulatedVehicleId = "BIKE002";
 
   singleSimulationVehicleId =
     simulatedVehicleId;
 
   // -----------------------------------------------------
-  // DEMO PHASES
+  // INITIAL SIMULATED VEHICLE
   // -----------------------------------------------------
-  //
-  // The simulator intentionally cycles through all four
-  // UI states so we can verify the warning system.
-  //
-  // EARLY:
-  //   nearby but low closing speed
-  //
-  // MEDIUM:
-  //   approaching with moderate TTC
-  //
-  // HIGH:
-  //   approaching with short TTC
-  //
-  // CRITICAL:
-  //   very short TTC and high closing speed
-  //
-  const phases = [
-    {
-      risk:
-        "EARLY",
-
-      distance:
-        45,
-
-      closing:
-        2.5,
-
-      ttc:
-        18,
-    },
-
-    {
-      risk:
-        "MEDIUM",
-
-      distance:
-        30,
-
-      closing:
-        5.0,
-
-      ttc:
-        6,
-    },
-
-    {
-      risk:
-        "HIGH",
-
-      distance:
-        18,
-
-      closing:
-        7.0,
-
-      ttc:
-        2.5,
-    },
-
-    {
-      risk:
-        "CRITICAL",
-
-      distance:
-        7,
-
-      closing:
-        14.0,
-
-      ttc:
-        0.5,
-    },
-  ];
 
   const simulatedVehicle = {
     vehicleId:
@@ -1530,19 +1497,20 @@ function startSingleSimulation() {
     type:
       "motorcycle",
 
+    // Start 100 metres NORTH of the user.
     latitude:
       targetVehicle.latitude +
-      (
-        45 /
-        111320
-      ),
+      START_DISTANCE_M / 111320,
 
     longitude:
       targetVehicle.longitude,
 
+    // 35 km/h while moving.
     speed:
-      5,
+      SIMULATION_SPEED_KMH,
 
+    // 180 = South.
+    // Vehicle therefore travels toward the user.
     direction:
       180,
 
@@ -1555,20 +1523,26 @@ function startSingleSimulation() {
     demoMode:
       true,
 
+    // Initial state.
     demoRisk:
       "EARLY",
 
+    demoApproaching:
+      true,
+
     demoClosingSpeedKmh:
-      2.5,
+      SIMULATION_SPEED_KMH,
 
     demoTtcSeconds:
-      18,
+      START_DISTANCE_M /
+      (SIMULATION_SPEED_KMH / 3.6),
 
     socketId:
       null,
 
+    // Very accurate simulated GPS.
     gpsAccuracy:
-      3,
+      1,
 
     gpsTimestamp:
       Date.now(),
@@ -1579,103 +1553,374 @@ function startSingleSimulation() {
     simulatedVehicle
   );
 
-  let step = 0;
+  // -----------------------------------------------------
+  // STATE
+  // -----------------------------------------------------
 
-  singleSimulationTimer =
-    setInterval(
-      () => {
-        const vehicle =
-          vehicles.get(
-            simulatedVehicleId
-          );
+  let distanceMeters =
+    START_DISTANCE_M;
 
-        const target =
-          vehicles.get(
-            targetVehicle.vehicleId
-          );
+  let phase =
+    "approaching";
 
+  let pauseUntil =
+    0;
+
+  let lastTick =
+    Date.now();
+
+  // -----------------------------------------------------
+  // RISK LEVEL
+  // -----------------------------------------------------
+
+  function riskForDistance(
+    distance,
+    approaching
+  ) {
+    // Moving away never produces collision risk.
+    if (!approaching) {
+      return "EARLY";
+    }
+
+    // CRITICAL:
+    // 5 metres or less while genuinely approaching.
+    if (distance <= 5) {
+      return "CRITICAL";
+    }
+
+    // HIGH:
+    // 5-20 metres while approaching.
+    if (distance <= 20) {
+      return "HIGH";
+    }
+
+    // MEDIUM:
+    // 20-45 metres while approaching.
+    if (distance <= 45) {
+      return "MEDIUM";
+    }
+
+    // EARLY:
+    // 45-100 metres while approaching.
+    return "EARLY";
+  }
+
+  // -----------------------------------------------------
+  // UPDATE SIMULATED VEHICLE
+  // -----------------------------------------------------
+
+  const updateSimulationVehicle =
+    () => {
+      const vehicle =
+        vehicles.get(
+          simulatedVehicleId
+        );
+
+      const target =
+        vehicles.get(
+          targetVehicle.vehicleId
+        );
+
+      // Real vehicle disconnected.
+      if (!vehicle || !target) {
+        stopSingleSimulation();
+        return;
+      }
+
+      const now =
+        Date.now();
+
+      // =================================================
+      // PAUSED AT 2 METRES
+      // =================================================
+
+      if (
+        phase ===
+        "paused"
+      ) {
         if (
-          !vehicle ||
-          !target
+          now <
+          pauseUntil
         ) {
-          stopSingleSimulation();
-          return;
+          // Completely stopped.
+          vehicle.speed =
+            0;
+
+          vehicle.direction =
+            180;
+
+          vehicle.braking =
+            false;
+
+          vehicle.demoRisk =
+            "EARLY";
+
+          vehicle.demoApproaching =
+            false;
+
+          vehicle.demoClosingSpeedKmh =
+            0;
+
+          vehicle.demoTtcSeconds =
+            null;
+        } else {
+          // Start moving away.
+          phase =
+            "receding";
+
+          lastTick =
+            now;
+
+          vehicle.speed =
+            SIMULATION_SPEED_KMH;
+
+          // 0 = North.
+          // Vehicle now moves away from user.
+          vehicle.direction =
+            0;
+
+          vehicle.braking =
+            false;
+
+          vehicle.demoRisk =
+            "EARLY";
+
+          vehicle.demoApproaching =
+            false;
+
+          vehicle.demoClosingSpeedKmh =
+            0;
+
+          vehicle.demoTtcSeconds =
+            null;
         }
+      }
 
-        step++;
+      // =================================================
+      // MOVING
+      // =================================================
 
-        const phaseIndex =
-          Math.min(
-            phases.length - 1,
-            Math.floor(
-              (step - 1) / 8
+      else {
+        const elapsedSeconds =
+          Math.max(
+            0,
+            Math.min(
+              1,
+              (now - lastTick) /
+                1000
             )
           );
 
-        const phase =
-          phases[
-            phaseIndex
-          ];
+        lastTick =
+          now;
 
-        // Demo geometry:
-        //
-        // The simulated vehicle is directly north
-        // of the target and faces south (180°).
-        //
-        // Its displayed risk is scripted for repeatable
-        // UI testing. Real vehicles still use the normal
-        // trajectory calculation.
-        vehicle.latitude =
-          target.latitude +
+        // 35 km/h -> metres/second.
+        const travelMeters =
           (
-            phase.distance /
-            111320
-          );
+            SIMULATION_SPEED_KMH /
+            3.6
+          ) *
+          elapsedSeconds;
 
-        vehicle.longitude =
-          target.longitude;
+        // =================================================
+        // APPROACH USER
+        // =================================================
 
-        vehicle.direction =
-          180;
-
-        vehicle.speed =
-          Math.max(
-            5,
-            phase.closing
-          );
-
-        vehicle.braking =
-          phase.risk ===
-          "CRITICAL";
-
-        vehicle.demoRisk =
-          phase.risk;
-
-        vehicle.demoClosingSpeedKmh =
-          phase.closing;
-
-        vehicle.demoTtcSeconds =
-          phase.ttc;
-
-        vehicle.gpsTimestamp =
-          Date.now();
-
-        vehicles.set(
-          simulatedVehicleId,
-          vehicle
-        );
-
-        updateAllClients();
-
-        // Repeat after CRITICAL.
         if (
-          step >=
-          phases.length * 8
+          phase ===
+          "approaching"
         ) {
-          step = 0;
+          distanceMeters -=
+            travelMeters;
+
+          // Reached 2 metres.
+          if (
+            distanceMeters <=
+            STOP_DISTANCE_M
+          ) {
+            distanceMeters =
+              STOP_DISTANCE_M;
+
+            phase =
+              "paused";
+
+            pauseUntil =
+              now +
+              PAUSE_AT_CLOSE_MS;
+
+            vehicle.speed =
+              0;
+
+            vehicle.direction =
+              180;
+
+            vehicle.braking =
+              true;
+
+            vehicle.demoRisk =
+              "EARLY";
+
+            vehicle.demoApproaching =
+              false;
+
+            vehicle.demoClosingSpeedKmh =
+              0;
+
+            vehicle.demoTtcSeconds =
+              null;
+          }
+
+          // Still approaching.
+          else {
+            vehicle.speed =
+              SIMULATION_SPEED_KMH;
+
+            // South.
+            vehicle.direction =
+              180;
+
+            vehicle.braking =
+              false;
+
+            vehicle.demoRisk =
+              riskForDistance(
+                distanceMeters,
+                true
+              );
+
+            vehicle.demoApproaching =
+              true;
+
+            vehicle.demoClosingSpeedKmh =
+              SIMULATION_SPEED_KMH;
+
+            // TTC = distance / speed.
+            vehicle.demoTtcSeconds =
+              distanceMeters /
+              (
+                SIMULATION_SPEED_KMH /
+                3.6
+              );
+          }
         }
-      },
-      1000
+
+        // =================================================
+        // MOVE AWAY FROM USER
+        // =================================================
+
+        else {
+          distanceMeters +=
+            travelMeters;
+
+          // Reached 100 metres.
+          if (
+            distanceMeters >=
+            START_DISTANCE_M
+          ) {
+            distanceMeters =
+              START_DISTANCE_M;
+
+            // Immediately start another
+            // approach cycle.
+            phase =
+              "approaching";
+
+            vehicle.speed =
+              SIMULATION_SPEED_KMH;
+
+            vehicle.direction =
+              180;
+
+            vehicle.braking =
+              false;
+
+            vehicle.demoRisk =
+              "EARLY";
+
+            vehicle.demoApproaching =
+              true;
+
+            vehicle.demoClosingSpeedKmh =
+              SIMULATION_SPEED_KMH;
+
+            vehicle.demoTtcSeconds =
+              START_DISTANCE_M /
+              (
+                SIMULATION_SPEED_KMH /
+                3.6
+              );
+          }
+
+          // Still moving away.
+          else {
+            vehicle.speed =
+              SIMULATION_SPEED_KMH;
+
+            // North.
+            vehicle.direction =
+              0;
+
+            vehicle.braking =
+              false;
+
+            vehicle.demoRisk =
+              "EARLY";
+
+            vehicle.demoApproaching =
+              false;
+
+            vehicle.demoClosingSpeedKmh =
+              0;
+
+            vehicle.demoTtcSeconds =
+              null;
+          }
+        }
+      }
+
+      // ---------------------------------------------------
+      // CALCULATE GPS POSITION
+      // ---------------------------------------------------
+      //
+      // 1 degree latitude ≈ 111,320 metres.
+      //
+      // Positive offset = north of user.
+      //
+
+      vehicle.latitude =
+        target.latitude +
+        distanceMeters /
+          111320;
+
+      vehicle.longitude =
+        target.longitude;
+
+      vehicle.gpsTimestamp =
+        Date.now();
+
+      vehicles.set(
+        simulatedVehicleId,
+        vehicle
+      );
+
+      // Send fresh data to all connected clients.
+      updateAllClients();
+    };
+
+  // -----------------------------------------------------
+  // FIRST UPDATE
+  // -----------------------------------------------------
+
+  updateSimulationVehicle();
+
+  // -----------------------------------------------------
+  // CONTINUOUS UPDATE
+  // -----------------------------------------------------
+
+  singleSimulationTimer =
+    setInterval(
+      updateSimulationVehicle,
+      UPDATE_MS
     );
 
   simulationActive =
@@ -1688,13 +1933,22 @@ function startSingleSimulation() {
       true,
 
     message:
-      "Deterministic collision-risk demo started: EARLY → MEDIUM → HIGH → CRITICAL.",
+      "Simulated vehicle running: 100 m → 2 m at 35 km/h, stops, then returns to 100 m and repeats.",
 
     vehicleId:
       simulatedVehicleId,
 
     demoMode:
       true,
+
+    startDistanceMeters:
+      START_DISTANCE_M,
+
+    stopDistanceMeters:
+      STOP_DISTANCE_M,
+
+    speedKmh:
+      SIMULATION_SPEED_KMH,
   };
 }
 
