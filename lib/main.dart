@@ -3941,16 +3941,17 @@ class _V2VHomePageState
             : '';
 
     final Map<String, double> prediction =
-    vehicle == null
-        ? <String, double>{
-            'approaching': 0,
-            'closingSpeedKmh': 0,
-            'ttcSeconds': double.infinity,
-          }
-        : _calculateCollisionPrediction(
-            vehicle,
-            distance,
-          );
+        vehicle == null
+            ? <String, double>{
+                'approaching': 0,
+                'closingSpeedKmh': 0,
+                'ttcSeconds': double.infinity,
+                'directionReliable': 0,
+              }
+            : _calculateCollisionPrediction(
+                vehicle,
+                distance,
+              );
     final bool approaching = (prediction['approaching'] ?? 0) == 1;
     final double closingSpeed = prediction['closingSpeedKmh'] ?? 0;
     final double ttc = prediction['ttcSeconds'] ?? double.infinity;
@@ -4695,24 +4696,10 @@ class _V2VHomePageState
     _lastVisualWarningKey = warningKey;
     _lastVisualWarningTime = now;
 
-    // SnackBar always provides a visible warning even when
-    // a dialog cannot be shown.
-    _showSnackBar(
-      message,
-      _statusColor(
-        normalized,
-      ),
-      duration: normalized ==
-              'CRITICAL'
-          ? const Duration(
-              seconds: 5,
-            )
-          : const Duration(
-              seconds: 3,
-            ),
-    );
+    // Risk notifications are shown in the Intelligence alert card itself.
+    // Do not show a floating SnackBar here; it covered the map and other UI.
 
-    // HIGH remains a visual card/SnackBar warning. A full dialog is reserved
+    // HIGH remains a visual in-app card warning. A full dialog is reserved
     // for a true CRITICAL event to avoid interrupting the user repeatedly.
     if (normalized != 'CRITICAL') {
       return;
